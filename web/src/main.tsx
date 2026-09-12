@@ -7,6 +7,23 @@ import "./phase3.css";
 type User = { id: string; email: string };
 type Config = { configured?: boolean; base_url?: string; api_key_set?: boolean; model?: string };
 type Project = { id: string; name: string; last_accessed_at: string };
+type Page = "home" | "projects" | "project" | "settings" | "auth";
+
+function pageFromPath(pathname: string): Page {
+  if (pathname === "/projects") return "projects";
+  if (/^\/projects\/[^/]+$/.test(pathname)) return "project";
+  if (pathname === "/settings") return "settings";
+  if (pathname === "/login") return "auth";
+  return "home";
+}
+
+function pathFor(page: Page, projectID?: string): string {
+  if (page === "projects") return "/projects";
+  if (page === "project") return projectID ? `/projects/${projectID}` : "/projects";
+  if (page === "settings") return "/settings";
+  if (page === "auth") return "/login";
+  return "/";
+}
 const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(`/api${path}`, { credentials: "include", headers: { "Content-Type": "application/json", ...(init?.headers || {}) }, ...init });
   if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "REQUEST_FAILED"); }
@@ -84,7 +101,7 @@ function LoginPrompt({ onLogin }: { onLogin: () => void }) {
 
 const NAV = [["home", "首页"], ["projects", "项目"], ["settings", "设置"]] as const;
 
-function Navigation({ page, setPage, user, onLogin, logout }: { page: string; setPage: (p: string) => void; user: User | null; onLogin: () => void; logout: () => void }) {
+function Navigation({ page, setPage, user, onLogin, logout }: { page: Page; setPage: (p: Page) => void; user: User | null; onLogin: () => void; logout: () => void }) {
   return (
     <aside>
       <div className="brand">atoms</div>
@@ -96,18 +113,18 @@ function Navigation({ page, setPage, user, onLogin, logout }: { page: string; se
   );
 }
 
-function Home({ setPage, user, project, onCreated, onLogin }: { setPage: (p: string) => void; user: User | null; project: Project | null; onCreated: (p: Project, initialDraft: string) => void; onLogin: () => void }) {
+function Home({ setPage, user, project, onCreated, onLogin }: { setPage: (p: Page, projectID?: string) => void; user: User | null; project: Project | null; onCreated: (p: Project, initialDraft: string) => void; onLogin: () => void }) {
   const [request, setRequest] = useState("");
   const [error, setError] = useState("");
   const [creating, setCreating] = useState(false);
   async function build() {
-    if (project) { setPage("project"); return; }
+    if (project) { setPage("project", project.id); return; }
     setError("");
     if (!request.trim()) { setError("请先描述你想构建的应用"); return; }
     setCreating(true);
     try {
       const r = await api<{ project: Project }>("/project", { method: "POST", body: JSON.stringify({ description: request.trim() }) });
-      onCreated(r.project, request.trim()); setPage("project");
+      onCreated(r.project, request.trim()); setPage("project", r.project.id);
     } catch (e) { setError(errorText(e)); }
     finally { setCreating(false); }
   }
@@ -139,7 +156,7 @@ function Home({ setPage, user, project, onCreated, onLogin }: { setPage: (p: str
   );
 }
 
-function Projects({ setPage, project, onDeleted, onRenamed }: { setPage: (p: string) => void; project: Project | null; onDeleted: () => void; onRenamed: (p: Project) => void }) {
+function Projects({ setPage, project, onDeleted, onRenamed }: { setPage: (p: Page, projectID?: string) => void; project: Project | null; onDeleted: () => void; onRenamed: (p: Project) => void }) {
   const [deployUrl, setDeployUrl] = useState("");
   const [deploying, setDeploying] = useState(false);
   const [error, setError] = useState("");
@@ -171,7 +188,7 @@ function Projects({ setPage, project, onDeleted, onRenamed }: { setPage: (p: str
       <p className="eyebrow">工作区</p>
       <h1>项目</h1>
       {project
-        ? <div className="project-card"><div>{editingName ? <form className="rename-form" onSubmit={rename}><input aria-label="项目名称" autoFocus maxLength={32} value={name} onChange={e => setName(e.target.value)} /><button>保存</button><button type="button" className="secondary" onClick={() => { setName(project.name); setEditingName(false); }}>取消</button></form> : <h2 className="editable-title" role="button" tabIndex={0} title="点击修改项目名称" onClick={() => setEditingName(true)} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setEditingName(true); } }}>{project.name}</h2>}</div><div className="card-actions"><button onClick={() => setPage("project")}>打开</button><button className="secondary" onClick={doDeploy}>部署</button><button className="danger" onClick={doDelete}>删除</button></div></div>
+        ? <div className="project-card"><div>{editingName ? <form className="rename-form" onSubmit={rename}><input aria-label="项目名称" autoFocus maxLength={32} value={name} onChange={e => setName(e.target.value)} /><button>保存</button><button type="button" className="secondary" onClick={() => { setName(project.name); setEditingName(false); }}>取消</button></form> : <h2 className="editable-title" role="button" tabIndex={0} title="点击修改项目名称" onClick={() => setEditingName(true)} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setEditingName(true); } }}>{project.name}</h2>}</div><div className="card-actions"><button onClick={() => setPage("project", project.id)}>打开</button><button className="secondary" onClick={doDeploy}>部署</button><button className="danger" onClick={doDelete}>删除</button></div></div>
         : <div className="empty"><h2>还没有项目</h2><p>从首页开始，描述你想构建的内容。</p></div>}
       {deploying && <p className="muted">正在部署…</p>}
       {deployUrl && <p className="success">已部署：<a href={deployUrl} target="_blank" rel="noreferrer">{deployUrl}</a></p>}
@@ -287,27 +304,52 @@ function Settings() {
 
 function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [page, setPage] = useState("home");
+  const [page, setPage] = useState<Page>(() => pageFromPath(location.pathname));
   const [project, setProject] = useState<Project | null>(null);
   const [workspaceDraft, setWorkspaceDraft] = useState("");
-  const [pendingPage, setPendingPage] = useState<string | null>(null);
-  useEffect(() => { api<User>("/me").then(setUser).catch(() => undefined); }, []);
+  const [pendingPath, setPendingPath] = useState<string | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [projectReady, setProjectReady] = useState(false);
   useEffect(() => {
-    if (user) api<{ project: Project | null }>("/project").then(r => setProject(r.project)).catch(() => undefined);
-    else setProject(null);
+    const onPopState = () => setPage(pageFromPath(location.pathname));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+  useEffect(() => { api<User>("/me").then(setUser).catch(() => undefined).finally(() => setAuthReady(true)); }, []);
+  useEffect(() => {
+    if (user) {
+      setProjectReady(false);
+      api<{ project: Project | null }>("/project").then(r => setProject(r.project)).catch(() => setProject(null)).finally(() => setProjectReady(true));
+    } else {
+      setProject(null);
+      setProjectReady(true);
+    }
   }, [user]);
-  const logout = async () => { await api("/auth/logout", { method: "POST" }); setUser(null); setProject(null); setWorkspaceDraft(""); setPage("home"); };
-  const login = (u: User) => { setUser(u); setPage(pendingPage || "home"); setPendingPage(null); };
-  const askLogin = () => { setPendingPage(page); setPage("auth"); };
+  const navigate = (next: Page, projectID?: string) => {
+    const target = pathFor(next, projectID || project?.id);
+    if (location.pathname !== target) window.history.pushState(null, "", target);
+    setPage(next);
+  };
+  const logout = async () => { await api("/auth/logout", { method: "POST" }); setUser(null); setProject(null); setWorkspaceDraft(""); navigate("home"); };
+  const login = (u: User) => {
+    const target = pendingPath || "/";
+    setUser(u);
+    setPendingPath(null);
+    if (location.pathname !== target) window.history.pushState(null, "", target);
+    setPage(pageFromPath(target));
+  };
+  const askLogin = () => { setPendingPath(location.pathname); navigate("auth"); };
   return (
     <div className="shell">
-      <Navigation page={page} setPage={setPage} user={user} onLogin={askLogin} logout={logout} />
+      <Navigation page={page} setPage={navigate} user={user} onLogin={askLogin} logout={logout} />
       <main>
-        {page === "home" && <Home setPage={setPage} user={user} project={project} onCreated={(p, initialDraft) => { setProject(p); setWorkspaceDraft(initialDraft); }} onLogin={askLogin} />}
-        {page === "projects" && (user ? <Projects setPage={setPage} project={project} onDeleted={() => setProject(null)} onRenamed={setProject} /> : <LoginPrompt onLogin={askLogin} />)}
-        {page === "settings" && (user ? <Settings /> : <LoginPrompt onLogin={askLogin} />)}
-        {page === "project" && (user && project ? <ProjectWorkspace project={project} initialDraft={workspaceDraft} onDraftConsumed={() => setWorkspaceDraft("")} /> : <LoginPrompt onLogin={askLogin} />)}
-        {page === "auth" && <Auth onUser={login} />}
+        {!authReady ? <section className="page"><p className="muted">正在加载…</p></section> : <>
+          {page === "home" && <Home setPage={navigate} user={user} project={project} onCreated={(p, initialDraft) => { setProject(p); setWorkspaceDraft(initialDraft); }} onLogin={askLogin} />}
+          {page === "projects" && (user ? <Projects setPage={navigate} project={project} onDeleted={() => setProject(null)} onRenamed={setProject} /> : <LoginPrompt onLogin={askLogin} />)}
+          {page === "settings" && (user ? <Settings /> : <LoginPrompt onLogin={askLogin} />)}
+          {page === "project" && (user ? (projectReady ? (project ? <ProjectWorkspace project={project} initialDraft={workspaceDraft} onDraftConsumed={() => setWorkspaceDraft("")} /> : <LoginPrompt onLogin={askLogin} />) : <section className="page"><p className="muted">正在加载项目…</p></section>) : <LoginPrompt onLogin={askLogin} />)}
+          {page === "auth" && <Auth onUser={login} />}
+        </>}
       </main>
     </div>
   );
