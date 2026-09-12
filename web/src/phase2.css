@@ -1,3 +1,60 @@
-.project-card { margin-top:2.5rem; padding:1.5rem 1.7rem; background:#fff; border:1px solid #e1e5ec; border-radius:14px; display:flex; align-items:center; justify-content:space-between; gap:2rem }
-.project-card h2 { margin:0 }.project-card p { color:#61708a }
-.workspace { padding:2rem clamp(1rem,4vw,4rem); height:100vh; display:flex; flex-direction:column; gap:1rem }.workspace header { display:flex; justify-content:space-between; align-items:center }.workspace h1 { margin:.2rem 0; font-size:1.5rem }.runtime { font-size:.85rem; color:#067647 }.preview-bar { background:#fff; border:1px solid #e1e5ec; border-radius:10px 10px 0 0; padding:.65rem .8rem; display:flex; align-items:center; justify-content:space-between; margin-bottom:-1rem; z-index:1 }.workspace iframe { border:1px solid #e1e5ec; border-radius:0 0 10px 10px; background:#fff; width:100%; flex:1; min-height:400px }
+.project-card {
+  margin-top: 2.5rem;
+  padding: 1.75rem 2rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .04);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2rem;
+  transition: box-shadow .18s ease, transform .18s ease;
+}
+.project-card:hover { box-shadow: 0 14px 34px -16px rgba(24, 24, 27, .18); transform: translateY(-2px); }
+.project-card h2 { margin: 0; }
+.project-card p { color: var(--color-muted); }
+
+.workspace {
+  padding: 1.75rem clamp(1rem, 4vw, 3rem);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  max-width: 1500px;
+  margin: 0 auto;
+  width: 100%;
+}
+.workspace header { display: flex; justify-content: space-between; align-items: center; }
+.workspace h1 { margin: .2rem 0; font-size: 1.4rem; font-weight: 700; letter-spacing: -.03em; }
+.runtime {
+  font-size: .8rem;
+  color: #16a34a;
+  background: #ecfdf3;
+  border: 1px solid #d1fae5;
+  padding: .3rem .7rem;
+  border-radius: 999px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.preview-bar {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 12px 12px 0 0;
+  padding: .6rem .9rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .6rem;
+  margin-bottom: -1px;
+  z-index: 1;
+}
+.preview-bar > div { display: flex; gap: .5rem; }
+.workspace iframe {
+  border: 1px solid var(--color-border);
+  border-radius: 0 0 12px 12px;
+  background: var(--color-surface);
+  width: 100%;
+  flex: 1;
+  min-height: 400px;
+}
