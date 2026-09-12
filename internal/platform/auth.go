@@ -23,12 +23,14 @@ type User struct {
 	Email string `json:"email"`
 }
 type authService struct {
-	db         *pgxpool.Pool
-	sessionKey []byte
+	db             *pgxpool.Pool
+	sessionKey     []byte
+	deployPortBase int
+	deployPortSpan int
 }
 
-func newAuthService(db *pgxpool.Pool, key []byte) *authService {
-	return &authService{db: db, sessionKey: key}
+func newAuthService(db *pgxpool.Pool, key []byte, portBase, portSpan int) *authService {
+	return &authService{db: db, sessionKey: key, deployPortBase: portBase, deployPortSpan: portSpan}
 }
 
 func (s *authService) register(w http.ResponseWriter, r *http.Request) {
@@ -46,7 +48,7 @@ func (s *authService) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := User{ID: newID(), Email: strings.ToLower(strings.TrimSpace(input.Email))}
-	_, err = s.db.Exec(r.Context(), `INSERT INTO users (id,email,password_hash) VALUES ($1,$2,$3)`, u.ID, u.Email, hash)
+	_, err = s.db.Exec(r.Context(), `INSERT INTO users (id,email,password_hash,deploy_port) SELECT $1,$2,$3,$4 + (nextval('user_port_seq') - 1) * $5`, u.ID, u.Email, hash, s.deployPortBase, s.deployPortSpan)
 	if err != nil {
 		apiError(w, http.StatusConflict, "EMAIL_ALREADY_REGISTERED")
 		return

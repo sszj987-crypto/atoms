@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -23,6 +24,8 @@ type Config struct {
 	RuntimeSweepInterval time.Duration
 	DataVolumeName       string
 	RuntimeNetwork       string
+	DeployPortBase       int
+	DeployPortSpan       int
 }
 
 func LoadConfig() (Config, error) {
@@ -62,7 +65,19 @@ func LoadConfig() (Config, error) {
 	if network == "" {
 		network = "atoms-internal"
 	}
-	return Config{DatabaseURL: db, MasterKey: key, SessionKey: sessionKey, Port: port, WebDir: webDir, ProjectRoot: projectRoot, RuntimeImage: image, RuntimeCPU: 2, RuntimeMemoryBytes: 2 << 30, RuntimePIDs: 256, RuntimeIdleTTL: 24 * time.Hour, RuntimeSweepInterval: 15 * time.Minute, DataVolumeName: volume, RuntimeNetwork: network}, nil
+	return Config{DatabaseURL: db, MasterKey: key, SessionKey: sessionKey, Port: port, WebDir: webDir, ProjectRoot: projectRoot, RuntimeImage: image, RuntimeCPU: 2, RuntimeMemoryBytes: 2 << 30, RuntimePIDs: 256, RuntimeIdleTTL: 24 * time.Hour, RuntimeSweepInterval: 15 * time.Minute, DataVolumeName: volume, RuntimeNetwork: network, DeployPortBase: envInt("DEPLOY_PORT_BASE", 18000), DeployPortSpan: envInt("DEPLOY_PORT_SPAN", 5)}, nil
+}
+
+func envInt(name string, def int) int {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || v <= 0 {
+		return def
+	}
+	return v
 }
 
 func requiredKey(name string) ([]byte, error) {

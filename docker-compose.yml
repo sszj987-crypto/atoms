@@ -12,6 +12,8 @@ services:
       WEB_DIR: /app/web/dist
       DATA_VOLUME_NAME: atoms-data
       RUNTIME_NETWORK: atoms-internal
+      DEPLOY_PORT_BASE: ${DEPLOY_PORT_BASE:-18000}
+      DEPLOY_PORT_SPAN: ${DEPLOY_PORT_SPAN:-5}
     volumes:
       - atoms-data:/data
       # Phase 2 will use this connection to manage disposable project runtimes.

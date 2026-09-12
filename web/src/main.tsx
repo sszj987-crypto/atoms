@@ -37,7 +37,7 @@ const statusText = (s: string) => {
   return zh[s] || s;
 };
 
-function Auth({ onUser, onCancel }: { onUser: (u: User) => void; onCancel: () => void }) {
+function Auth({ onUser }: { onUser: (u: User) => void }) {
   const [registering, setRegistering] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -62,7 +62,6 @@ function Auth({ onUser, onCancel }: { onUser: (u: User) => void; onCancel: () =>
           <button>{registering ? "注册" : "登录"}</button>
         </form>
         <button className="text-button" onClick={() => setRegistering(!registering)}>{registering ? "已有账户？去登录" : "没有账户？去注册"}</button>
-        <button className="text-button" onClick={onCancel}>← 返回首页</button>
       </section>
     </div>
   );
@@ -133,14 +132,32 @@ function Home({ setPage, user, project, onCreated, onLogin }: { setPage: (p: str
   );
 }
 
-function Projects({ setPage, project }: { setPage: (p: string) => void; project: Project | null }) {
+function Projects({ setPage, project, onDeleted }: { setPage: (p: string) => void; project: Project | null; onDeleted: () => void }) {
+  const [deployUrl, setDeployUrl] = useState("");
+  const [deploying, setDeploying] = useState(false);
+  const [error, setError] = useState("");
+  async function doDeploy() {
+    setDeploying(true); setError(""); setDeployUrl("");
+    try { const r = await api<{ port: string }>("/project/deploy", { method: "POST" }); setDeployUrl(`http://${location.hostname}:${r.port}`); }
+    catch (e) { setError(errorText(e)); }
+    finally { setDeploying(false); }
+  }
+  async function doDelete() {
+    if (!confirm("确定删除该项目？此操作不可恢复。")) return;
+    setError("");
+    try { await api("/project", { method: "DELETE" }); onDeleted(); }
+    catch (e) { setError(errorText(e)); }
+  }
   return (
     <section className="page">
       <p className="eyebrow">工作区</p>
       <h1>项目</h1>
       {project
-        ? <div className="project-card"><div><h2>{project.name}</h2><p>P0 阶段每个账户支持一个项目，访问时自动恢复运行环境。</p></div><button onClick={() => setPage("project")}>打开 →</button></div>
-        : <div className="empty"><h2>还没有项目</h2><p>从首页开始，描述你想构建的内容。</p><button onClick={() => setPage("home")}>去首页</button></div>}
+        ? <div className="project-card"><div><h2>{project.name}</h2><p>P0 阶段每个账户支持一个项目，访问时自动恢复运行环境。</p></div><div className="card-actions"><button onClick={() => setPage("project")}>打开 →</button><button className="secondary" onClick={doDeploy}>部署</button><button className="danger" onClick={doDelete}>删除</button></div></div>
+        : <div className="empty"><h2>还没有项目</h2><p>从首页开始，描述你想构建的内容。</p></div>}
+      {deploying && <p className="muted">正在部署…</p>}
+      {deployUrl && <p className="success">已部署：<a href={deployUrl} target="_blank" rel="noreferrer">{deployUrl}</a></p>}
+      {error && <p className="error">{error}</p>}
     </section>
   );
 }
@@ -260,10 +277,10 @@ function App() {
       <Navigation page={page} setPage={setPage} user={user} onLogin={askLogin} logout={logout} />
       <main>
         {page === "home" && <Home setPage={setPage} user={user} project={project} onCreated={setProject} onLogin={askLogin} />}
-        {page === "projects" && (user ? <Projects setPage={setPage} project={project} /> : <LoginPrompt onLogin={askLogin} />)}
+        {page === "projects" && (user ? <Projects setPage={setPage} project={project} onDeleted={() => setProject(null)} /> : <LoginPrompt onLogin={askLogin} />)}
         {page === "settings" && (user ? <Settings /> : <LoginPrompt onLogin={askLogin} />)}
         {page === "project" && (user && project ? <ProjectWorkspace project={project} /> : <LoginPrompt onLogin={askLogin} />)}
-        {page === "auth" && <Auth onUser={login} onCancel={() => { setPendingPage(null); setPage("home"); }} />}
+        {page === "auth" && <Auth onUser={login} />}
       </main>
     </div>
   );

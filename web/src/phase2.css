@@ -14,6 +14,10 @@
 .project-card:hover { box-shadow: 0 14px 34px -16px rgba(24, 24, 27, .18); transform: translateY(-2px); }
 .project-card h2 { margin: 0; }
 .project-card p { color: var(--color-muted); }
+.card-actions { display: flex; gap: .6rem; align-items: center; flex-shrink: 0; }
+.danger { background: #fee2e2; color: #dc2626; box-shadow: none; }
+.danger:hover:not(:disabled) { background: #fecaca; filter: none; }
+a { color: var(--color-accent); }
 
 .workspace {
   padding: 1.75rem clamp(1rem, 4vw, 3rem);

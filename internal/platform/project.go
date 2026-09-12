@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,7 @@ type Project struct {
 	DBUsername           string    `json:"-"`
 	DBPasswordCiphertext []byte    `json:"-"`
 	LastAccessedAt       time.Time `json:"last_accessed_at"`
+	DeployPort           int       `json:"-"`
 }
 type projectService struct {
 	db     *pgxpool.Pool
@@ -159,6 +161,28 @@ func (s *projectService) restart(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]string{"status": "starting"})
 }
+func (s *projectService) deploy(w http.ResponseWriter, r *http.Request) {
+	p, err := s.current(r.Context(), r.Context().Value(currentUserKey{}).(User).ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		apiError(w, 404, "PROJECT_NOT_FOUND")
+		return
+	}
+	if err != nil {
+		apiError(w, 500, "PROJECT_READ_FAILED")
+		return
+	}
+	// Recreate so the container is always created with the published deploy port,
+	// even if a pre-deploy runtime (no port) is already running.
+	if err := s.docker.remove(r.Context(), runtimeName(p.ID)); err != nil {
+		apiError(w, 503, "RUNTIME_UNAVAILABLE")
+		return
+	}
+	if err := s.ensureRuntime(r.Context(), p); err != nil {
+		apiError(w, 503, "RUNTIME_UNAVAILABLE")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"port": strconv.Itoa(p.DeployPort)})
+}
 
 var errProjectExists = errors.New("one project per user")
 
@@ -219,7 +243,7 @@ func quoteIdent(v string) string   { return `"` + strings.ReplaceAll(v, `"`, `""
 func quoteLiteral(v string) string { return `'` + strings.ReplaceAll(v, `'`, `''`) + `'` }
 func (s *projectService) current(ctx context.Context, userID string) (Project, error) {
 	var p Project
-	err := s.db.QueryRow(ctx, `SELECT id,name,workspace_path,codex_state_path,db_schema,db_username,db_password_ciphertext,last_accessed_at FROM projects WHERE user_id=$1`, userID).Scan(&p.ID, &p.Name, &p.WorkspacePath, &p.CodexStatePath, &p.DBSchema, &p.DBUsername, &p.DBPasswordCiphertext, &p.LastAccessedAt)
+	err := s.db.QueryRow(ctx, `SELECT p.id,p.name,p.workspace_path,p.codex_state_path,p.db_schema,p.db_username,p.db_password_ciphertext,p.last_accessed_at,COALESCE(u.deploy_port,0) FROM projects p JOIN users u ON u.id=p.user_id WHERE p.user_id=$1`, userID).Scan(&p.ID, &p.Name, &p.WorkspacePath, &p.CodexStatePath, &p.DBSchema, &p.DBUsername, &p.DBPasswordCiphertext, &p.LastAccessedAt, &p.DeployPort)
 	return p, err
 }
 func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
@@ -240,7 +264,7 @@ func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
 		return err
 	}
 	databaseURL := fmt.Sprintf("postgres://%s:%s@postgres:5432/atoms?sslmode=disable&search_path=%s", url.QueryEscape(p.DBUsername), url.QueryEscape(password), url.QueryEscape(p.DBSchema))
-	if err = s.docker.createAndStart(ctx, p, databaseURL, s.cfg.RuntimeImage, s.cfg.DataVolumeName, s.cfg.RuntimeNetwork, s.cfg.RuntimeCPU, s.cfg.RuntimeMemoryBytes, s.cfg.RuntimePIDs); err != nil {
+	if err = s.docker.createAndStart(ctx, p, databaseURL, s.cfg.RuntimeImage, s.cfg.DataVolumeName, s.cfg.RuntimeNetwork, strconv.Itoa(p.DeployPort), s.cfg.RuntimeCPU, s.cfg.RuntimeMemoryBytes, s.cfg.RuntimePIDs); err != nil {
 		return err
 	}
 	s.touch(ctx, p.ID)

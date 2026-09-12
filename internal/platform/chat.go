@@ -153,7 +153,11 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 			}
 		}
 	}
-	_, _ = s.projects.db.Exec(ctx, `INSERT INTO messages(id,project_id,role,content) SELECT $1,$2,'assistant',$3 WHERE EXISTS (SELECT 1 FROM agent_runs WHERE id=$4 AND status <> 'CANCELLED')`, newID(), p.ID, "Application update completed.", runID)
+	summary := extractSummary(out)
+	if summary == "" {
+		summary = "应用更新完成。"
+	}
+	_, _ = s.projects.db.Exec(ctx, `INSERT INTO messages(id,project_id,role,content) SELECT $1,$2,'assistant',$3 WHERE EXISTS (SELECT 1 FROM agent_runs WHERE id=$4 AND status <> 'CANCELLED')`, newID(), p.ID, summary, runID)
 	_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='COMPLETED',finished_at=now() WHERE id=$1 AND status <> 'CANCELLED'`, runID)
 }
 func (s *chatService) verify(ctx context.Context, p Project) error {
@@ -260,3 +264,23 @@ func (s *chatService) ownedRun(w http.ResponseWriter, r *http.Request) (runView,
 	return v, true
 }
 func terminal(s string) bool { return s == "COMPLETED" || s == "FAILED" || s == "CANCELLED" }
+func extractSummary(raw []byte) string {
+	var last string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var ev struct {
+			Type string `json:"type"`
+			Item struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"item"`
+		}
+		if json.Unmarshal([]byte(line), &ev) == nil && ev.Type == "item.completed" && ev.Item.Type == "agent_message" && strings.TrimSpace(ev.Item.Text) != "" {
+			last = ev.Item.Text
+		}
+	}
+	return last
+}

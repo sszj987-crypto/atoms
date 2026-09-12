@@ -46,10 +46,15 @@ func NewApp(ctx context.Context, cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	// Backfill per-user deploy ports for accounts created before this feature.
+	if _, err := db.Exec(ctx, `UPDATE users SET deploy_port = $1 + (nextval('user_port_seq') - 1) * $2 WHERE deploy_port IS NULL`, cfg.DeployPortBase, cfg.DeployPortSpan); err != nil {
+		db.Close()
+		return nil, err
+	}
 	projects := newProjectService(db, cfg)
 	projects.recover(ctx)
 	projects.startCleanup(context.Background())
-	return &App{cfg: cfg, db: db, auth: newAuthService(db, cfg.SessionKey), model: newModelService(db, cfg.MasterKey), projects: projects, chat: newChatService(projects)}, nil
+	return &App{cfg: cfg, db: db, auth: newAuthService(db, cfg.SessionKey, cfg.DeployPortBase, cfg.DeployPortSpan), model: newModelService(db, cfg.MasterKey), projects: projects, chat: newChatService(projects)}, nil
 }
 
 func (a *App) Close() { a.db.Close() }
@@ -95,6 +100,7 @@ func (a *App) platformHandler() http.Handler {
 			r.Get("/project/preview-access", a.previewAccess)
 			r.Get("/project/runtime/status", a.projects.runtimeStatus)
 			r.Post("/project/runtime/restart", a.projects.restart)
+			r.Post("/project/deploy", a.projects.deploy)
 			r.Get("/project/messages", a.chat.messages)
 			r.Post("/project/messages", a.chat.send)
 			r.Get("/project/runs/{id}", a.chat.runInfo)

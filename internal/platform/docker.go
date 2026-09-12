@@ -91,7 +91,7 @@ func (d *dockerClient) managedProjectIDs(ctx context.Context) ([]string, error) 
 	}
 	return ids, nil
 }
-func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseURL, image, dataVolume, network string, cpu, memory, pids int64) error {
+func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseURL, image, dataVolume, network, deployPort string, cpu, memory, pids int64) error {
 	name := runtimeName(p.ID)
 	body := map[string]any{
 		"Image": image, "WorkingDir": "/workspace",
@@ -105,6 +105,7 @@ func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseUR
 			"Memory":      memory,
 			"PidsLimit":   pids,
 			"NetworkMode": network,
+			"PortBindings": map[string]any{"3000/tcp": []map[string]string{{"HostPort": deployPort}}},
 			"Mounts": []map[string]any{
 				{"Type": "volume", "Source": dataVolume, "Target": "/workspace", "VolumeOptions": map[string]any{"Subpath": volumeSubpath(p.WorkspacePath)}},
 				{"Type": "volume", "Source": dataVolume, "Target": "/codex", "VolumeOptions": map[string]any{"Subpath": volumeSubpath(p.CodexStatePath)}},
