@@ -1,16 +1,29 @@
-.workspace-body { display: grid; grid-template-columns: minmax(280px, 36%) 1fr; gap: 1rem; flex: 1; min-height: 0; }
-.chat, .preview { min-height: 0; display: flex; flex-direction: column; gap: .7rem; }
-.chat { background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 12px; padding: 1rem; }
-.chat textarea { height: 96px; }
-.history { overflow: auto; flex: 1; display: flex; flex-direction: column; gap: .5rem; }
-.history p { padding: .65rem .8rem; border-radius: 10px; background: #f4f4f5; color: var(--color-ink); margin: 0; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
-.history p.user { background: var(--color-accent-soft); }
-.run-progress { max-height: 12rem; overflow: auto; border-left: 3px solid var(--color-accent); padding-left: .7rem; color: var(--color-muted); font-size: .88rem; }
-.run-progress p { margin: .35rem 0; }
-.preview-bar { display: flex; align-items: center; justify-content: space-between; gap: .75rem; flex-wrap: wrap; }
-.preview-addressbar { flex: 1; min-width: min(100%, 20rem); display: flex; align-items: center; gap: .5rem; padding: .1rem .75rem; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 10px; }
-.preview-addressbar span { color: var(--color-muted); font-size: 1.1rem; }
-.preview-addressbar input { min-width: 0; margin: 0; padding: .52rem 0; border: 0; border-radius: 0; box-shadow: none; background: transparent; color: var(--color-ink-soft); }
+.preview { overflow: hidden; border: 1px solid var(--color-border); border-radius: 14px; background: var(--color-surface); }
+.preview-bar { min-height: 51px; padding: .45rem .55rem; display: flex; align-items: center; gap: .6rem; background: #f4f4f6; border-bottom: 1px solid var(--color-border); }
+.browser-dots { display: flex; gap: 5px; padding: 0 .25rem; }
+.browser-dots i { width: 7px; height: 7px; border-radius: 50%; background: #c8c8cf; }
+.browser-dots i:first-child { background: #f29b8e; }
+.browser-dots i:nth-child(2) { background: #e8c76d; }
+.browser-dots i:last-child { background: #83c995; }
+.preview-addressbar { flex: 1; min-width: 0; display: flex; align-items: center; gap: .5rem; padding: 0 .72rem; background: var(--color-surface); border: 1px solid #dedee5; border-radius: 8px; transition: border-color .15s ease, box-shadow .15s ease; }
+.preview-addressbar:focus-within { border-color: var(--color-accent); box-shadow: 0 0 0 3px rgba(99, 102, 241, .1); }
+.preview-addressbar span { color: var(--color-muted); font-size: 1rem; }
+.preview-addressbar input { min-width: 0; margin: 0; padding: .46rem 0; border: 0; border-radius: 0; box-shadow: none; background: transparent; color: var(--color-ink-soft); font-size: .78rem; }
 .preview-addressbar input:focus { border: 0; box-shadow: none; }
-.preview-actions { display: flex; gap: .45rem; }
-.preview iframe { min-height: 0; }
+.preview-actions { display: flex; gap: .4rem; }
+.icon-button { width: 34px; height: 34px; padding: 0; display: grid; place-items: center; border: 1px solid #dedee5; background: var(--color-surface); color: var(--color-ink-soft); box-shadow: none; font-size: 1.05rem; }
+.icon-button:hover:not(:disabled) { background: #fafafa; box-shadow: none; }
+.preview iframe { width: 100%; min-height: 0; flex: 1; border: 0; background: var(--color-surface); }
+.preview-loading { flex: 1; display: grid; place-content: center; justify-items: center; gap: .75rem; color: var(--color-muted); font-size: .84rem; }
+.preview-loading p { margin: 0; }
+.spinner { width: 22px; height: 22px; border: 2px solid #e5e5ea; border-top-color: var(--color-accent); border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 520px) {
+  .browser-dots { display: none; }
+  .preview-bar { gap: .4rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}
