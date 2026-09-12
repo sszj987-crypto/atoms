@@ -13,8 +13,13 @@
 }
 .project-card:hover { box-shadow: 0 14px 34px -16px rgba(24, 24, 27, .18); transform: translateY(-2px); }
 .project-card h2 { margin: 0; }
-.project-card p { color: var(--color-muted); }
+.editable-title { cursor: pointer; width: fit-content; }
+.editable-title::after { content: "编辑"; display: inline-block; margin-left: .55rem; color: var(--color-accent); font-size: .75rem; font-weight: 600; opacity: 0; transition: opacity .15s ease; vertical-align: middle; }
+.editable-title:hover::after, .editable-title:focus-visible::after { opacity: 1; }
+.editable-title:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 4px; border-radius: 4px; }
 .card-actions { display: flex; gap: .6rem; align-items: center; flex-shrink: 0; }
+.rename-form { display: flex; align-items: center; gap: .5rem; }
+.rename-form input { margin: 0; min-width: 12rem; }
 .danger { background: #fee2e2; color: #dc2626; box-shadow: none; }
 .danger:hover:not(:disabled) { background: #fecaca; filter: none; }
 a { color: var(--color-accent); }

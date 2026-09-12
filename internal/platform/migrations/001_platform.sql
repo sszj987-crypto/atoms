@@ -52,3 +52,10 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   finished_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS agent_run_events (
+  id BIGSERIAL PRIMARY KEY,
+  run_id UUID NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  content TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

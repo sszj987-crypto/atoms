@@ -25,6 +25,9 @@ const errorText = (e: unknown) => {
     AUTH_REQUIRED: "请先登录",
     PROJECT_LIMIT_REACHED: "每个账户只能创建一个项目",
     RUN_IN_PROGRESS: "有任务正在运行",
+    MODEL_CONFIG_REQUIRED: "请先在设置中配置模型服务",
+    MODEL_TITLE_UNAVAILABLE: "模型暂时无法生成项目名称，请稍后重试",
+    INVALID_PROJECT_NAME: "项目名称需为 1–32 个字符",
   };
   return zh[m] || m.replaceAll("_", " ");
 };
@@ -93,16 +96,20 @@ function Navigation({ page, setPage, user, onLogin, logout }: { page: string; se
   );
 }
 
-function Home({ setPage, user, project, onCreated, onLogin }: { setPage: (p: string) => void; user: User | null; project: Project | null; onCreated: (p: Project) => void; onLogin: () => void }) {
+function Home({ setPage, user, project, onCreated, onLogin }: { setPage: (p: string) => void; user: User | null; project: Project | null; onCreated: (p: Project, initialDraft: string) => void; onLogin: () => void }) {
   const [request, setRequest] = useState("");
   const [error, setError] = useState("");
+  const [creating, setCreating] = useState(false);
   async function build() {
     if (project) { setPage("project"); return; }
     setError("");
+    if (!request.trim()) { setError("请先描述你想构建的应用"); return; }
+    setCreating(true);
     try {
-      const r = await api<{ project: Project }>("/project", { method: "POST", body: JSON.stringify({ name: request.trim() || "未命名项目" }) });
-      onCreated(r.project); setPage("project");
+      const r = await api<{ project: Project }>("/project", { method: "POST", body: JSON.stringify({ description: request.trim() }) });
+      onCreated(r.project, request.trim()); setPage("project");
     } catch (e) { setError(errorText(e)); }
+    finally { setCreating(false); }
   }
   if (!user) {
     return (
@@ -111,7 +118,7 @@ function Home({ setPage, user, project, onCreated, onLogin }: { setPage: (p: str
           <p className="eyebrow">构建你的下一个应用</p>
           <h1>用对话，构建 <span className="grad">Web 应用</span></h1>
           <p className="muted">描述一个专注的 Web 应用，平台会为你创建隔离的运行环境，并实时预览成果。</p>
-          <button onClick={onLogin}>开始使用 →</button>
+          <button onClick={onLogin}>开始使用</button>
           <p className="hint">登录后即可创建项目、请求修改并实时预览。</p>
         </div>
       </section>
@@ -125,17 +132,20 @@ function Home({ setPage, user, project, onCreated, onLogin }: { setPage: (p: str
         <p className="muted">{project ? `当前项目是「${project.name}」，运行时和预览已就绪。` : "描述一个专注的 Web 应用，创建它的隔离环境。"}</p>
         <textarea aria-label="描述你的应用" value={request} onChange={e => setRequest(e.target.value)} placeholder={project ? "打开工作区以请求修改。" : "描述你的应用…"} disabled={!!project} />
         {error && <p className="error">{error}</p>}
-        <button onClick={build}>{project ? "打开项目 →" : "创建项目 →"}</button>
+        <button onClick={build} disabled={creating}>{project ? "打开项目" : creating ? "正在生成项目名称…" : "创建项目"}</button>
         <p className="hint">{project ? "请求修改并在实时预览中查看结果。" : <>创建前请先在 <button className="link" onClick={() => setPage("settings")}>设置</button> 里配置模型服务。</>}</p>
       </div>
     </section>
   );
 }
 
-function Projects({ setPage, project, onDeleted }: { setPage: (p: string) => void; project: Project | null; onDeleted: () => void }) {
+function Projects({ setPage, project, onDeleted, onRenamed }: { setPage: (p: string) => void; project: Project | null; onDeleted: () => void; onRenamed: (p: Project) => void }) {
   const [deployUrl, setDeployUrl] = useState("");
   const [deploying, setDeploying] = useState(false);
   const [error, setError] = useState("");
+  const [editingName, setEditingName] = useState(false);
+  const [name, setName] = useState(project?.name || "");
+  useEffect(() => { if (!editingName) setName(project?.name || ""); }, [project?.id, project?.name, editingName]);
   async function doDeploy() {
     setDeploying(true); setError(""); setDeployUrl("");
     try { const r = await api<{ port: string }>("/project/deploy", { method: "POST" }); setDeployUrl(`http://${location.hostname}:${r.port}`); }
@@ -148,12 +158,20 @@ function Projects({ setPage, project, onDeleted }: { setPage: (p: string) => voi
     try { await api("/project", { method: "DELETE" }); onDeleted(); }
     catch (e) { setError(errorText(e)); }
   }
+  async function rename(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    try {
+      const r = await api<{ project: Project }>("/project", { method: "PATCH", body: JSON.stringify({ name }) });
+      onRenamed(r.project); setEditingName(false);
+    } catch (e) { setError(errorText(e)); }
+  }
   return (
     <section className="page">
       <p className="eyebrow">工作区</p>
       <h1>项目</h1>
       {project
-        ? <div className="project-card"><div><h2>{project.name}</h2><p>P0 阶段每个账户支持一个项目，访问时自动恢复运行环境。</p></div><div className="card-actions"><button onClick={() => setPage("project")}>打开 →</button><button className="secondary" onClick={doDeploy}>部署</button><button className="danger" onClick={doDelete}>删除</button></div></div>
+        ? <div className="project-card"><div>{editingName ? <form className="rename-form" onSubmit={rename}><input aria-label="项目名称" autoFocus maxLength={32} value={name} onChange={e => setName(e.target.value)} /><button>保存</button><button type="button" className="secondary" onClick={() => { setName(project.name); setEditingName(false); }}>取消</button></form> : <h2 className="editable-title" role="button" tabIndex={0} title="点击修改项目名称" onClick={() => setEditingName(true)} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setEditingName(true); } }}>{project.name}</h2>}</div><div className="card-actions"><button onClick={() => setPage("project")}>打开</button><button className="secondary" onClick={doDeploy}>部署</button><button className="danger" onClick={doDelete}>删除</button></div></div>
         : <div className="empty"><h2>还没有项目</h2><p>从首页开始，描述你想构建的内容。</p></div>}
       {deploying && <p className="muted">正在部署…</p>}
       {deployUrl && <p className="success">已部署：<a href={deployUrl} target="_blank" rel="noreferrer">{deployUrl}</a></p>}
@@ -162,22 +180,27 @@ function Projects({ setPage, project, onDeleted }: { setPage: (p: string) => voi
   );
 }
 
-function ProjectWorkspace({ project }: { project: Project }) {
+function ProjectWorkspace({ project, initialDraft, onDraftConsumed }: { project: Project; initialDraft: string; onDraftConsumed: () => void }) {
   const [status, setStatus] = useState("正在恢复项目环境…");
   const [reload, setReload] = useState(0);
   const [messages, setMessages] = useState<{ id: string; role: string; content: string }[]>([]);
   const [text, setText] = useState("");
   const [run, setRun] = useState<string | null>(null);
-  const [inspect, setInspect] = useState(false);
-  const [selected, setSelected] = useState<unknown>(null);
-  const [token, setToken] = useState("");
+  const [progress, setProgress] = useState<string[]>([]);
+  const [previewURL, setPreviewURL] = useState("");
   const load = () => api<{ messages: { id: string; role: string; content: string }[] }>("/project/messages").then(r => setMessages(r.messages));
   useEffect(() => {
-    const h = (e: MessageEvent) => { if (e.data?.type === "atoms-selected-ui") { setSelected(e.data.selected_ui); setInspect(false); } };
-    window.addEventListener("message", h);
-    return () => window.removeEventListener("message", h);
-  }, []);
-  useEffect(() => { api<{ preview_token: string }>("/project/preview-access").then(r => setToken(r.preview_token)).catch(() => undefined); }, []);
+    if (!initialDraft) return;
+    setText(initialDraft);
+    onDraftConsumed();
+  }, [initialDraft, onDraftConsumed]);
+  useEffect(() => {
+    let active = true;
+    api<{ port: number }>("/project/preview-access").then(r => {
+      if (active && Number.isInteger(r.port) && r.port > 0) setPreviewURL(`${location.protocol}//${location.hostname}:${r.port}`);
+    }).catch(() => { if (active) setStatus("预览地址不可用"); });
+    return () => { active = false; };
+  }, [project.id]);
   useEffect(() => {
     load();
     api<{ exists: boolean; running: boolean }>("/project/runtime/status").then(s => setStatus(s.running ? "运行时运行中" : "运行时启动中")).catch(() => setStatus("运行时不可用"));
@@ -185,6 +208,10 @@ function ProjectWorkspace({ project }: { project: Project }) {
   useEffect(() => {
     if (!run) return;
     const e = new EventSource(`/api/project/runs/${run}/events`);
+    e.addEventListener("progress", v => {
+      const x = JSON.parse((v as MessageEvent).data);
+      setProgress(items => [...items, x.content].slice(-30));
+    });
     e.addEventListener("status", v => {
       const x = JSON.parse((v as MessageEvent).data);
       setStatus(x.status);
@@ -194,10 +221,10 @@ function ProjectWorkspace({ project }: { project: Project }) {
   }, [run]);
   async function send() {
     if (!text.trim() || run) return;
-    const r = await api<{ run_id: string }>("/project/messages", { method: "POST", body: JSON.stringify({ content: text, selected_ui: selected }) });
-    setText(""); setSelected(null); load(); setRun(r.run_id);
+    const r = await api<{ run_id: string }>("/project/messages", { method: "POST", body: JSON.stringify({ content: text, selected_ui: null }) });
+    setText(""); setProgress([]); load(); setRun(r.run_id);
   }
-  const preview = `http://p-${project.id}.localhost:8080/?preview_token=${token}&preview=${reload}`;
+  const previewAddress = previewURL || "正在准备项目地址…";
   return (
     <section className="workspace">
       <header>
@@ -207,20 +234,19 @@ function ProjectWorkspace({ project }: { project: Project }) {
       <div className="workspace-body">
         <aside className="chat">
           <div className="history">{messages.map(m => <p key={m.id} className={m.role}>{m.content}</p>)}</div>
-          {Boolean(selected) && <p className="muted">已选中界面元素，准备就绪</p>}
+          {run && <div className="run-progress" aria-live="polite">{progress.length ? progress.map((item, index) => <p key={`${index}-${item}`}>{item}</p>) : <p>正在排队…</p>}</div>}
           {run && <p className="muted">{statusText(status)} <button className="link" onClick={() => api(`/project/runs/${run}/cancel`, { method: "POST" })}>取消</button></p>}
           <textarea value={text} onChange={e => setText(e.target.value)} placeholder="描述你想要的修改…" />
           <button onClick={send} disabled={!!run}>发送</button>
         </aside>
         <div className="preview">
           <div className="preview-bar">
-            <strong>预览</strong>
-            <div>
-              <button className="secondary" onClick={() => setReload(v => v + 1)}>刷新</button>
-              <button className="secondary" onClick={() => { setInspect(v => !v); document.querySelector<HTMLIFrameElement>('iframe[title="Project preview"]')?.contentWindow?.postMessage({ type: "atoms-inspect", enabled: !inspect }, "*"); }}>检查界面</button>
+            <div className="preview-addressbar"><span aria-hidden="true">⌕</span><input aria-label="项目预览地址" readOnly value={previewAddress} /></div>
+            <div className="preview-actions">
+              <button className="secondary" onClick={() => setReload(v => v + 1)} disabled={!previewURL}>刷新</button>
             </div>
           </div>
-          {token ? <iframe key={reload} title="Project preview" src={preview} /> : <p className="muted">正在加载预览…</p>}
+          {previewURL ? <iframe key={reload} title="项目预览" src={previewURL} /> : <p className="muted">正在启动项目预览…</p>}
         </div>
       </div>
     </section>
@@ -263,23 +289,24 @@ function App() {
   const [user, setUser] = useState<User | null>(null);
   const [page, setPage] = useState("home");
   const [project, setProject] = useState<Project | null>(null);
+  const [workspaceDraft, setWorkspaceDraft] = useState("");
   const [pendingPage, setPendingPage] = useState<string | null>(null);
   useEffect(() => { api<User>("/me").then(setUser).catch(() => undefined); }, []);
   useEffect(() => {
     if (user) api<{ project: Project | null }>("/project").then(r => setProject(r.project)).catch(() => undefined);
     else setProject(null);
   }, [user]);
-  const logout = async () => { await api("/auth/logout", { method: "POST" }); setUser(null); setProject(null); setPage("home"); };
+  const logout = async () => { await api("/auth/logout", { method: "POST" }); setUser(null); setProject(null); setWorkspaceDraft(""); setPage("home"); };
   const login = (u: User) => { setUser(u); setPage(pendingPage || "home"); setPendingPage(null); };
   const askLogin = () => { setPendingPage(page); setPage("auth"); };
   return (
     <div className="shell">
       <Navigation page={page} setPage={setPage} user={user} onLogin={askLogin} logout={logout} />
       <main>
-        {page === "home" && <Home setPage={setPage} user={user} project={project} onCreated={setProject} onLogin={askLogin} />}
-        {page === "projects" && (user ? <Projects setPage={setPage} project={project} onDeleted={() => setProject(null)} /> : <LoginPrompt onLogin={askLogin} />)}
+        {page === "home" && <Home setPage={setPage} user={user} project={project} onCreated={(p, initialDraft) => { setProject(p); setWorkspaceDraft(initialDraft); }} onLogin={askLogin} />}
+        {page === "projects" && (user ? <Projects setPage={setPage} project={project} onDeleted={() => setProject(null)} onRenamed={setProject} /> : <LoginPrompt onLogin={askLogin} />)}
         {page === "settings" && (user ? <Settings /> : <LoginPrompt onLogin={askLogin} />)}
-        {page === "project" && (user && project ? <ProjectWorkspace project={project} /> : <LoginPrompt onLogin={askLogin} />)}
+        {page === "project" && (user && project ? <ProjectWorkspace project={project} initialDraft={workspaceDraft} onDraftConsumed={() => setWorkspaceDraft("")} /> : <LoginPrompt onLogin={askLogin} />)}
         {page === "auth" && <Auth onUser={login} />}
       </main>
     </div>

@@ -38,10 +38,11 @@ type projectService struct {
 	db     *pgxpool.Pool
 	cfg    Config
 	docker *dockerClient
+	model  *modelService
 }
 
-func newProjectService(db *pgxpool.Pool, cfg Config) *projectService {
-	return &projectService{db: db, cfg: cfg, docker: newDockerClient()}
+func newProjectService(db *pgxpool.Pool, cfg Config, model *modelService) *projectService {
+	return &projectService{db: db, cfg: cfg, docker: newDockerClient(), model: model}
 }
 
 func (s *projectService) get(w http.ResponseWriter, r *http.Request) {
@@ -59,14 +60,23 @@ func (s *projectService) get(w http.ResponseWriter, r *http.Request) {
 }
 func (s *projectService) create(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Name string `json:"name"`
+		Description string `json:"description"`
 	}
-	if decodeJSON(r, &input) != nil {
+	if decodeJSON(r, &input) != nil || strings.TrimSpace(input.Description) == "" {
 		apiError(w, 400, "INVALID_PROJECT")
 		return
 	}
 	u := r.Context().Value(currentUserKey{}).(User)
-	p, err := s.createProject(r.Context(), u.ID, input.Name)
+	name, err := s.model.projectTitle(r.Context(), u.ID, input.Description)
+	if errors.Is(err, errModelConfigRequired) {
+		apiError(w, 400, "MODEL_CONFIG_REQUIRED")
+		return
+	}
+	if err != nil {
+		apiError(w, 422, "MODEL_TITLE_UNAVAILABLE")
+		return
+	}
+	p, err := s.createProject(r.Context(), u.ID, name)
 	if errors.Is(err, errProjectExists) {
 		apiError(w, 409, "PROJECT_LIMIT_REACHED")
 		return
@@ -76,6 +86,36 @@ func (s *projectService) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, map[string]any{"project": p})
+}
+func (s *projectService) rename(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Name string `json:"name"`
+	}
+	if decodeJSON(r, &input) != nil {
+		apiError(w, 400, "INVALID_PROJECT_NAME")
+		return
+	}
+	name := strings.TrimSpace(input.Name)
+	if name == "" || len([]rune(name)) > 32 {
+		apiError(w, 400, "INVALID_PROJECT_NAME")
+		return
+	}
+	u := r.Context().Value(currentUserKey{}).(User)
+	p, err := s.current(r.Context(), u.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		apiError(w, http.StatusNotFound, "PROJECT_NOT_FOUND")
+		return
+	}
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, "PROJECT_READ_FAILED")
+		return
+	}
+	if _, err := s.db.Exec(r.Context(), `UPDATE projects SET name=$1 WHERE id=$2 AND user_id=$3`, name, p.ID, u.ID); err != nil {
+		apiError(w, http.StatusInternalServerError, "PROJECT_RENAME_FAILED")
+		return
+	}
+	p.Name = name
+	writeJSON(w, http.StatusOK, map[string]any{"project": p})
 }
 func (s *projectService) delete(w http.ResponseWriter, r *http.Request) {
 	u := r.Context().Value(currentUserKey{}).(User)

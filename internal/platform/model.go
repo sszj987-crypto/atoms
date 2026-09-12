@@ -2,7 +2,10 @@ package platform
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -10,6 +13,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var (
+	errModelConfigRequired   = errors.New("model configuration is required")
+	errModelTitleUnavailable = errors.New("model title is unavailable")
 )
 
 type modelService struct {
@@ -112,4 +120,122 @@ func (s *modelService) testResponses(r *http.Request, in modelInput) bool {
 	}
 	defer res.Body.Close()
 	return res.StatusCode >= 200 && res.StatusCode < 300
+}
+
+func (s *modelService) projectTitle(ctx context.Context, userID, description string) (string, error) {
+	var in modelInput
+	var sealed []byte
+	err := s.db.QueryRow(ctx, `SELECT base_url,api_key_ciphertext,model FROM llm_configs WHERE user_id=$1`, userID).Scan(&in.BaseURL, &sealed, &in.Model)
+	if err != nil {
+		return "", errModelConfigRequired
+	}
+	in.APIKey, err = decrypt(s.key, sealed)
+	if err != nil || !validateModelInput(in) {
+		return "", errModelConfigRequired
+	}
+	body, _ := json.Marshal(map[string]any{
+		"model":             in.Model,
+		"instructions":      "只返回项目名称本身。不要复述用户要求、需求内容、提示词或任何说明。",
+		"input":             "根据下面的 Web 应用需求，生成一个简洁、具体的中文项目名称。名称不超过 16 个汉字或 32 个字符。只输出名称本身，不要解释、引号、序号或标点。\n\n需求：\n" + strings.TrimSpace(description),
+		"max_output_tokens": 48,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(in.BaseURL, "/")+"/responses", bytes.NewReader(body))
+	if err != nil {
+		return "", errModelTitleUnavailable
+	}
+	req.Header.Set("Authorization", "Bearer "+in.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := s.client.Do(req)
+	if err != nil {
+		return "", errModelTitleUnavailable
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", errModelTitleUnavailable
+	}
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+	if err != nil {
+		return "", errModelTitleUnavailable
+	}
+	var response struct {
+		OutputText json.RawMessage `json:"output_text"`
+		Output     []struct {
+			Content []struct {
+				Text json.RawMessage `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+		Choices []struct {
+			Message struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(raw, &response) != nil {
+		return "", errModelTitleUnavailable
+	}
+	title := responseText(response.OutputText)
+	if title == "" {
+		for _, output := range response.Output {
+			for _, content := range output.Content {
+				if text := responseText(content.Text); text != "" {
+					title = text
+					break
+				}
+			}
+			if title != "" {
+				break
+			}
+		}
+	}
+	if title == "" && len(response.Choices) > 0 {
+		title = responseText(response.Choices[0].Message.Content)
+	}
+	title = strings.Trim(strings.TrimSpace(strings.Split(title, "\n")[0]), " \t\"'“”‘’「」")
+	if title == "" {
+		return "", errModelTitleUnavailable
+	}
+	runes := []rune(title)
+	if len(runes) > 32 {
+		title = string(runes[:32])
+	}
+	if !usableProjectTitle(title) {
+		return "", errModelTitleUnavailable
+	}
+	return title, nil
+}
+
+func usableProjectTitle(title string) bool {
+	title = strings.TrimSpace(title)
+	if title == "" || strings.ContainsAny(title, ":：\n\r") {
+		return false
+	}
+	for _, prefix := range []string{"用户要求", "项目名称", "为 Web 应用", "为web应用"} {
+		if strings.HasPrefix(strings.ToLower(title), strings.ToLower(prefix)) {
+			return false
+		}
+	}
+	return true
+}
+
+// responseText accepts both the canonical Responses API string fields and the
+// object-shaped text values returned by several Responses-compatible providers.
+func responseText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var wrapped struct {
+		Value string `json:"value"`
+		Text  string `json:"text"`
+	}
+	if json.Unmarshal(raw, &wrapped) == nil {
+		if wrapped.Value != "" {
+			return wrapped.Value
+		}
+		return wrapped.Text
+	}
+	return ""
 }

@@ -51,10 +51,11 @@ func NewApp(ctx context.Context, cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
-	projects := newProjectService(db, cfg)
+	model := newModelService(db, cfg.MasterKey)
+	projects := newProjectService(db, cfg, model)
 	projects.recover(ctx)
 	projects.startCleanup(context.Background())
-	return &App{cfg: cfg, db: db, auth: newAuthService(db, cfg.SessionKey, cfg.DeployPortBase, cfg.DeployPortSpan), model: newModelService(db, cfg.MasterKey), projects: projects, chat: newChatService(projects)}, nil
+	return &App{cfg: cfg, db: db, auth: newAuthService(db, cfg.SessionKey, cfg.DeployPortBase, cfg.DeployPortSpan), model: model, projects: projects, chat: newChatService(projects)}, nil
 }
 
 func (a *App) Close() { a.db.Close() }
@@ -64,9 +65,19 @@ func (a *App) Router() http.Handler {
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Logger, middleware.Recoverer, middleware.Timeout(30*time.Second))
 	r.Handle("/*", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if projectID := previewProjectID(r.Host); projectID != "" {
-			if userID, tokenProjectID, ok := a.auth.readPreview(r.URL.Query().Get("preview_token")); ok && tokenProjectID == projectID {
+			token := r.URL.Query().Get("preview_token")
+			fromQuery := token != ""
+			if !fromQuery {
+				if cookie, err := r.Cookie(previewCookie); err == nil {
+					token = cookie.Value
+				}
+			}
+			if userID, tokenProjectID, ok := a.auth.readPreview(token); ok && tokenProjectID == projectID {
 				var u User
 				if err := a.db.QueryRow(r.Context(), `SELECT id,email FROM users WHERE id=$1`, userID).Scan(&u.ID, &u.Email); err == nil {
+					if fromQuery {
+						a.auth.setPreviewCookie(w, token)
+					}
 					a.preview(w, contextWithUser(r, u))
 					return
 				}
@@ -96,6 +107,7 @@ func (a *App) platformHandler() http.Handler {
 			r.Post("/llm-config/test", a.model.test)
 			r.Get("/project", a.projects.get)
 			r.Post("/project", a.projects.create)
+			r.Patch("/project", a.projects.rename)
 			r.Delete("/project", a.projects.delete)
 			r.Get("/project/preview-access", a.previewAccess)
 			r.Get("/project/runtime/status", a.projects.runtimeStatus)
@@ -129,7 +141,11 @@ func (a *App) previewAccess(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, "PROJECT_READ_FAILED")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"preview_token": a.auth.signPreview(u.ID, p.ID)})
+	if err := a.projects.ensureRuntime(r.Context(), p); err != nil {
+		apiError(w, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"preview_token": a.auth.signPreview(u.ID, p.ID), "port": p.DeployPort})
 }
 
 func (a *App) preview(w http.ResponseWriter, r *http.Request) {

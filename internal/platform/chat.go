@@ -91,6 +91,7 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 	_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='RUNNING' WHERE id=$1`, runID)
+	s.progress(ctx, runID, "正在读取模型配置…")
 	var base, model string
 	var sealed []byte
 	err := s.projects.db.QueryRow(ctx, `SELECT base_url,api_key_ciphertext,model FROM llm_configs WHERE user_id=$1`, userID).Scan(&base, &sealed, &model)
@@ -107,6 +108,7 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 		s.fail(ctx, runID, "Runtime could not be started.")
 		return
 	}
+	s.progress(ctx, runID, "正在准备隔离运行环境…")
 	config := fmt.Sprintf("model_provider = \"atoms\"\nmodel = %q\n[model_providers.atoms]\nname = \"Atoms\"\nbase_url = %q\nenv_key = \"OPENAI_API_KEY\"\nwire_api = \"responses\"\n", model, strings.TrimRight(base, "/"))
 	if err = os.WriteFile(filepath.Join(p.CodexStatePath, "config.toml"), []byte(config), 0600); err != nil {
 		s.fail(ctx, runID, "Session configuration failed.")
@@ -129,7 +131,15 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 		cmd = append(cmd, "resume", "--last")
 	}
 	cmd = append(cmd, task)
-	out, err := s.projects.docker.exec(ctx, runtimeName(p.ID), cmd, []string{"CODEX_HOME=/codex", "OPENAI_API_KEY=" + key})
+	s.progress(ctx, runID, "Codex 正在分析并修改项目…")
+	lastProgress := ""
+	out, err := s.projects.docker.execStream(ctx, runtimeName(p.ID), cmd, []string{"CODEX_HOME=/codex", "OPENAI_API_KEY=" + key}, func(line []byte) {
+		message := codexProgress(line)
+		if message != "" && message != lastProgress {
+			lastProgress = message
+			s.progress(ctx, runID, message)
+		}
+	})
 	// Execution logs are retained for diagnosis but must never persist the provider key.
 	redacted := []byte(strings.ReplaceAll(string(out), key, "[REDACTED]"))
 	_ = os.WriteFile(filepath.Join(filepath.Dir(p.WorkspacePath), "logs", runID+".ndjson"), redacted, 0600)
@@ -139,6 +149,7 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 	}
 	for repair := 0; repair <= 2; repair++ {
 		_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='VERIFYING' WHERE id=$1`, runID)
+		s.progress(ctx, runID, "正在验证类型、测试、构建和预览…")
 		if verifyErr := s.verify(ctx, p); verifyErr == nil {
 			break
 		} else if repair == 2 {
@@ -146,6 +157,7 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 			return
 		} else {
 			_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='REPAIRING' WHERE id=$1`, runID)
+			s.progress(ctx, runID, "验证未通过，Codex 正在修复…")
 			fix := []string{"codex", "exec", "resume", "--last", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "Fix the verification failure: " + verifyErr.Error() + ". Then rerun the required checks."}
 			if _, err := s.projects.docker.exec(ctx, runtimeName(p.ID), fix, []string{"CODEX_HOME=/codex", "OPENAI_API_KEY=" + key}); err != nil {
 				s.fail(ctx, runID, "Automatic repair failed.")
@@ -159,6 +171,7 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 	}
 	_, _ = s.projects.db.Exec(ctx, `INSERT INTO messages(id,project_id,role,content) SELECT $1,$2,'assistant',$3 WHERE EXISTS (SELECT 1 FROM agent_runs WHERE id=$4 AND status <> 'CANCELLED')`, newID(), p.ID, summary, runID)
 	_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='COMPLETED',finished_at=now() WHERE id=$1 AND status <> 'CANCELLED'`, runID)
+	s.progress(ctx, runID, "已完成。")
 }
 func (s *chatService) verify(ctx context.Context, p Project) error {
 	for _, cmd := range [][]string{{"sh", "-lc", "pnpm typecheck"}, {"sh", "-lc", "pnpm test"}, {"sh", "-lc", "pnpm build"}, {"sh", "-lc", "curl -fsS http://127.0.0.1:3000/ >/dev/null"}} {
@@ -170,6 +183,44 @@ func (s *chatService) verify(ctx context.Context, p Project) error {
 }
 func (s *chatService) fail(ctx context.Context, id, msg string) {
 	_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='FAILED',error_message=$2,finished_at=now() WHERE id=$1`, id, msg)
+	s.progress(ctx, id, msg)
+}
+func (s *chatService) progress(ctx context.Context, runID, message string) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	_, _ = s.projects.db.Exec(ctx, `INSERT INTO agent_run_events(run_id,content) VALUES($1,$2)`, runID, message)
+}
+func codexProgress(line []byte) string {
+	var event struct {
+		Type string `json:"type"`
+		Item struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"item"`
+	}
+	if json.Unmarshal(line, &event) != nil {
+		return ""
+	}
+	switch event.Type {
+	case "thread.started", "turn.started":
+		return "Codex 正在开始处理请求…"
+	case "item.started", "item.updated", "item.completed":
+		switch event.Item.Type {
+		case "reasoning":
+			return "Codex 正在分析实现方案…"
+		case "command_execution":
+			return "Codex 正在检查或执行项目命令…"
+		case "file_change":
+			return "Codex 正在修改项目文件…"
+		case "agent_message":
+			if event.Type == "item.completed" && strings.TrimSpace(event.Item.Text) != "" {
+				return "Codex 已完成一轮处理。"
+			}
+		}
+	}
+	return ""
 }
 func hasSession(root string) bool {
 	found := false
@@ -203,10 +254,25 @@ func (s *chatService) events(w http.ResponseWriter, r *http.Request) {
 	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	var lastEventID int64
 	for {
 		run, exists := s.ownedRun(w, r)
 		if !exists {
 			return
+		}
+		rows, err := s.projects.db.Query(r.Context(), `SELECT id,content,created_at FROM agent_run_events WHERE run_id=$1 AND id>$2 ORDER BY id`, run.ID, lastEventID)
+		if err == nil {
+			for rows.Next() {
+				var id int64
+				var content string
+				var createdAt any
+				if rows.Scan(&id, &content, &createdAt) == nil {
+					lastEventID = id
+					raw, _ := json.Marshal(map[string]any{"content": content, "created_at": createdAt})
+					fmt.Fprintf(w, "event: progress\ndata: %s\n\n", raw)
+				}
+			}
+			rows.Close()
 		}
 		raw, _ := json.Marshal(run)
 		fmt.Fprintf(w, "event: status\ndata: %s\n\n", raw)

@@ -15,7 +15,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const sessionCookie = "atoms_session"
+const (
+	sessionCookie = "atoms_session"
+	previewCookie = "atoms_preview"
+)
 
 type currentUserKey struct{}
 type User struct {
@@ -163,12 +166,27 @@ func (s *authService) readPreview(v string) (string, string, bool) {
 	if err != nil || !hmac.Equal(sig, mac.Sum(nil)) {
 		return "", "", false
 	}
-	var payload struct { UserID string `json:"uid"`; ProjectID string `json:"pid"`; Exp int64 `json:"exp"` }
+	var payload struct {
+		UserID    string `json:"uid"`
+		ProjectID string `json:"pid"`
+		Exp       int64  `json:"exp"`
+	}
 	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil || json.Unmarshal(raw, &payload) != nil || payload.UserID == "" || payload.ProjectID == "" || payload.Exp < time.Now().Unix() {
 		return "", "", false
 	}
 	return payload.UserID, payload.ProjectID, true
+}
+func (s *authService) setPreviewCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     previewCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   false,
+		MaxAge:   int((10 * time.Minute).Seconds()),
+	})
 }
 func validEmail(v string) bool {
 	v = strings.TrimSpace(v)

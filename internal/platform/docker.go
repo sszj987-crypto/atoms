@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -101,10 +102,10 @@ func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseUR
 		"Env":    []string{"DATABASE_URL=" + databaseURL, "NEXT_TELEMETRY_DISABLED=1"},
 		"Labels": map[string]string{"atoms.managed": "true", "atoms.project_id": p.ID},
 		"HostConfig": map[string]any{
-			"NanoCpus":    cpu * 1_000_000_000,
-			"Memory":      memory,
-			"PidsLimit":   pids,
-			"NetworkMode": network,
+			"NanoCpus":     cpu * 1_000_000_000,
+			"Memory":       memory,
+			"PidsLimit":    pids,
+			"NetworkMode":  network,
 			"PortBindings": map[string]any{"3000/tcp": []map[string]string{{"HostPort": deployPort}}},
 			"Mounts": []map[string]any{
 				{"Type": "volume", "Source": dataVolume, "Target": "/workspace", "VolumeOptions": map[string]any{"Subpath": volumeSubpath(p.WorkspacePath)}},
@@ -143,6 +144,9 @@ func (d *dockerClient) remove(ctx context.Context, name string) error {
 	return dockerError(res)
 }
 func (d *dockerClient) exec(ctx context.Context, name string, cmd, env []string) ([]byte, error) {
+	return d.execStream(ctx, name, cmd, env, nil)
+}
+func (d *dockerClient) execStream(ctx context.Context, name string, cmd, env []string, onLine func([]byte)) ([]byte, error) {
 	res, err := d.request(ctx, http.MethodPost, "/containers/"+url.PathEscape(name)+"/exec", map[string]any{"AttachStdout": true, "AttachStderr": true, "Tty": true, "Cmd": cmd, "Env": env, "WorkingDir": "/workspace", "User": "node"})
 	if err != nil {
 		return nil, err
@@ -165,9 +169,18 @@ func (d *dockerClient) exec(ctx context.Context, name string, cmd, env []string)
 	if res.StatusCode != http.StatusOK {
 		return nil, dockerError(res)
 	}
-	out, err := io.ReadAll(io.LimitReader(res.Body, 8<<20))
-	if err != nil {
-		return nil, err
+	var out bytes.Buffer
+	scanner := bufio.NewScanner(io.LimitReader(res.Body, 8<<20))
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	for scanner.Scan() {
+		line := append(append([]byte(nil), scanner.Bytes()...), '\n')
+		_, _ = out.Write(line)
+		if onLine != nil {
+			onLine(line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return out.Bytes(), err
 	}
 	res, err = d.request(ctx, http.MethodGet, "/exec/"+url.PathEscape(created.ID)+"/json", nil)
 	if err != nil {
@@ -181,9 +194,9 @@ func (d *dockerClient) exec(ctx context.Context, name string, cmd, env []string)
 		return nil, fmt.Errorf("docker exec inspect failed")
 	}
 	if state.ExitCode != 0 {
-		return out, fmt.Errorf("command exited %d", state.ExitCode)
+		return out.Bytes(), fmt.Errorf("command exited %d", state.ExitCode)
 	}
-	return out, nil
+	return out.Bytes(), nil
 }
 func dockerError(res *http.Response) error {
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
