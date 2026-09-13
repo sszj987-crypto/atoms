@@ -36,9 +36,9 @@ function pathFor(page: Page, projectID?: string): string {
   if (page === "auth") return "/login";
   return "/";
 }
-const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
+const api = async <T,>(path: string, init?: RequestInit, timeoutMs = 30_000): Promise<T> => {
   const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), 30_000);
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
   const abort = () => controller.abort();
   init?.signal?.addEventListener("abort", abort, { once: true });
   try {
@@ -272,7 +272,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
     let active = true;
     setPreviewURL("");
     setPreviewError("");
-    api<{ port: number }>(`/project/${project.id}/preview-access`).then(r => {
+    api<{ port: number }>(`/project/${project.id}/preview-access`, undefined, 120_000).then(r => {
       if (active && Number.isInteger(r.port) && r.port > 0) setPreviewURL(`${location.protocol}//${location.hostname}:${r.port}`);
     }).catch(() => {
       if (active) {

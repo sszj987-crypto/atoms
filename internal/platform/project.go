@@ -464,7 +464,7 @@ func (s *projectService) hasActiveRun(ctx context.Context, projectID string) (bo
 	return active, err
 }
 func waitRuntimeReady(ctx context.Context, projectID string) error {
-	deadline := time.NewTimer(25 * time.Second)
+	deadline := time.NewTimer(120 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()

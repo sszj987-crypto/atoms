@@ -181,7 +181,6 @@ func (a *App) platformHandler() http.Handler {
 			r.Post("/project", a.projects.create)
 			r.Patch("/project/{id}", a.projects.rename)
 			r.Delete("/project/{id}", a.projects.delete)
-			r.Get("/project/{id}/preview-access", a.previewAccess)
 			r.Get("/project/{id}/runtime/status", a.projects.runtimeStatus)
 			r.Post("/project/{id}/runtime/restart", a.projects.restart)
 			r.Post("/project/{id}/deploy", a.projects.deploy)
@@ -191,6 +190,8 @@ func (a *App) platformHandler() http.Handler {
 			r.Get("/project/runs/{id}", a.chat.runInfo)
 			r.Post("/project/runs/{id}/cancel", a.chat.cancel)
 		})
+		// preview-access waits for the runtime to boot (cold start can exceed 30s); exclude it from the timeout.
+		r.With(a.auth.requireUser).Get("/project/{id}/preview-access", a.previewAccess)
 		// SSE is long-lived (agent runs take minutes); exclude it from the request timeout.
 		r.With(a.auth.requireUser).Get("/project/runs/{id}/events", a.chat.events)
 	})
