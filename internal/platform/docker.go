@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -131,10 +132,13 @@ func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseUR
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusCreated {
-		return dockerError(res)
+		createErr := dockerError(res)
+		log.Printf("docker createAndStart create failed project=%s deployPort=%s err=%v", p.ID, deployPort, createErr)
+		return createErr
 	}
 	res, err = d.request(ctx, http.MethodPost, "/containers/"+url.PathEscape(name)+"/start", nil)
 	if err != nil {
+		log.Printf("docker createAndStart start request failed project=%s deployPort=%s err=%v", p.ID, deployPort, err)
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = d.remove(cleanupCtx, name)
@@ -143,6 +147,7 @@ func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseUR
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusNoContent && res.StatusCode != http.StatusNotModified {
 		startErr := dockerError(res)
+		log.Printf("docker createAndStart start failed project=%s deployPort=%s err=%v", p.ID, deployPort, startErr)
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = d.remove(cleanupCtx, name)

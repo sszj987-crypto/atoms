@@ -412,6 +412,7 @@ func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
 func (s *projectService) ensureRuntimeLocked(ctx context.Context, p Project) error {
 	status, err := s.docker.inspect(ctx, runtimeName(p.ID))
 	if err != nil {
+		log.Printf("ensureRuntime inspect failed project=%s err=%v", p.ID, err)
 		return err
 	}
 	if status.Running {
@@ -419,15 +420,18 @@ func (s *projectService) ensureRuntimeLocked(ctx context.Context, p Project) err
 	}
 	if status.Exists {
 		if err := s.docker.remove(ctx, runtimeName(p.ID)); err != nil {
+			log.Printf("ensureRuntime remove failed project=%s err=%v", p.ID, err)
 			return err
 		}
 	}
 	password, err := decrypt(s.cfg.MasterKey, p.DBPasswordCiphertext)
 	if err != nil {
+		log.Printf("ensureRuntime decrypt failed project=%s err=%v", p.ID, err)
 		return err
 	}
 	databaseURL := fmt.Sprintf("postgres://%s:%s@postgres:5432/atoms?sslmode=disable&search_path=%s", url.QueryEscape(p.DBUsername), url.QueryEscape(password), url.QueryEscape(p.DBSchema))
 	if err = s.docker.createAndStart(ctx, p, databaseURL, s.cfg.RuntimeImage, s.cfg.DataVolumeName, s.cfg.RuntimeNetwork, strconv.Itoa(p.DeployPort), s.cfg.RuntimeCPU, s.cfg.RuntimeMemoryBytes, s.cfg.RuntimePIDs); err != nil {
+		log.Printf("ensureRuntime createAndStart failed project=%s deployPort=%d err=%v", p.ID, p.DeployPort, err)
 		return err
 	}
 	s.touch(ctx, p.ID)
@@ -478,8 +482,10 @@ func waitRuntimeReady(ctx context.Context, projectID string) error {
 		}
 		select {
 		case <-ctx.Done():
+			log.Printf("waitRuntimeReady ctx done project=%s err=%v", projectID, ctx.Err())
 			return ctx.Err()
 		case <-deadline.C:
+			log.Printf("waitRuntimeReady timeout project=%s", projectID)
 			return errRuntimeUnavailable
 		case <-ticker.C:
 		}

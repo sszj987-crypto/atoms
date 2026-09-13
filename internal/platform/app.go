@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -217,13 +218,16 @@ func (a *App) previewAccess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.projects.ensureRuntime(r.Context(), p); err != nil {
+		log.Printf("preview-access ensureRuntime failed project=%s deployPort=%d err=%v", p.ID, p.DeployPort, err)
 		apiError(w, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE")
 		return
 	}
 	if err := waitRuntimeReady(r.Context(), p.ID); err != nil {
+		log.Printf("preview-access waitRuntimeReady failed project=%s deployPort=%d err=%v", p.ID, p.DeployPort, err)
 		apiError(w, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE")
 		return
 	}
+	log.Printf("preview-access ok project=%s deployPort=%d", p.ID, p.DeployPort)
 	writeJSON(w, http.StatusOK, map[string]any{"preview_token": a.auth.signPreview(u.ID, p.ID), "port": p.DeployPort})
 }
 
