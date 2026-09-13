@@ -126,6 +126,7 @@ func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseUR
 			},
 		},
 	}
+	log.Printf("docker createAndStart create project=%s deployPort=%q portBindings=%v", p.ID, deployPort, map[string]any{"3000/tcp": []map[string]string{{"HostPort": deployPort}}})
 	res, err := d.request(ctx, http.MethodPost, "/containers/create?name="+url.QueryEscape(name), body)
 	if err != nil {
 		return err
