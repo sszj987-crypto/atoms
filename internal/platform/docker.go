@@ -109,6 +109,7 @@ func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseUR
 	name := runtimeName(p.ID)
 	body := map[string]any{
 		"Image": image, "WorkingDir": "/workspace",
+		"ExposedPorts": map[string]any{"3000/tcp": map[string]any{}},
 		// The preview server is the Runtime's primary process. This avoids a
 		// detached docker-exec race and lets Docker report a failed startup.
 		"Cmd":    []string{"sh", "-lc", "if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile --prefer-offline; else pnpm install --frozen-lockfile=false --prefer-offline; fi && pnpm dev --hostname 0.0.0.0 --port 3000"},
