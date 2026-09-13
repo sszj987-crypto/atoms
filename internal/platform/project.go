@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -46,17 +48,15 @@ func newProjectService(db *pgxpool.Pool, cfg Config, model *modelService) *proje
 }
 
 func (s *projectService) get(w http.ResponseWriter, r *http.Request) {
-	p, err := s.current(r.Context(), r.Context().Value(currentUserKey{}).(User).ID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeJSON(w, 200, map[string]any{"project": nil})
-		return
-	}
+	projects, err := s.list(r.Context(), r.Context().Value(currentUserKey{}).(User).ID)
 	if err != nil {
 		apiError(w, 500, "PROJECT_READ_FAILED")
 		return
 	}
-	s.touch(r.Context(), p.ID)
-	writeJSON(w, 200, map[string]any{"project": p})
+	if projects == nil {
+		projects = []Project{}
+	}
+	writeJSON(w, 200, map[string]any{"projects": projects})
 }
 func (s *projectService) create(w http.ResponseWriter, r *http.Request) {
 	var input struct {
@@ -96,12 +96,12 @@ func (s *projectService) rename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(input.Name)
-	if name == "" || len([]rune(name)) > 32 {
+	if !validProjectName(name) {
 		apiError(w, 400, "INVALID_PROJECT_NAME")
 		return
 	}
 	u := r.Context().Value(currentUserKey{}).(User)
-	p, err := s.current(r.Context(), u.ID)
+	p, err := s.byID(r.Context(), u.ID, chi.URLParam(r, "id"))
 	if errors.Is(err, pgx.ErrNoRows) {
 		apiError(w, http.StatusNotFound, "PROJECT_NOT_FOUND")
 		return
@@ -119,7 +119,7 @@ func (s *projectService) rename(w http.ResponseWriter, r *http.Request) {
 }
 func (s *projectService) delete(w http.ResponseWriter, r *http.Request) {
 	u := r.Context().Value(currentUserKey{}).(User)
-	p, err := s.current(r.Context(), u.ID)
+	p, err := s.byID(r.Context(), u.ID, chi.URLParam(r, "id"))
 	if errors.Is(err, pgx.ErrNoRows) {
 		apiError(w, http.StatusNotFound, "PROJECT_NOT_FOUND")
 		return
@@ -164,7 +164,7 @@ func (s *projectService) delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *projectService) runtimeStatus(w http.ResponseWriter, r *http.Request) {
-	p, err := s.current(r.Context(), r.Context().Value(currentUserKey{}).(User).ID)
+	p, err := s.byID(r.Context(), r.Context().Value(currentUserKey{}).(User).ID, chi.URLParam(r, "id"))
 	if errors.Is(err, pgx.ErrNoRows) {
 		apiError(w, 404, "PROJECT_NOT_FOUND")
 		return
@@ -182,7 +182,7 @@ func (s *projectService) runtimeStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"exists": status.Exists, "running": status.Running})
 }
 func (s *projectService) restart(w http.ResponseWriter, r *http.Request) {
-	p, err := s.current(r.Context(), r.Context().Value(currentUserKey{}).(User).ID)
+	p, err := s.byID(r.Context(), r.Context().Value(currentUserKey{}).(User).ID, chi.URLParam(r, "id"))
 	if errors.Is(err, pgx.ErrNoRows) {
 		apiError(w, 404, "PROJECT_NOT_FOUND")
 		return
@@ -202,7 +202,7 @@ func (s *projectService) restart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "starting"})
 }
 func (s *projectService) deploy(w http.ResponseWriter, r *http.Request) {
-	p, err := s.current(r.Context(), r.Context().Value(currentUserKey{}).(User).ID)
+	p, err := s.byID(r.Context(), r.Context().Value(currentUserKey{}).(User).ID, chi.URLParam(r, "id"))
 	if errors.Is(err, pgx.ErrNoRows) {
 		apiError(w, 404, "PROJECT_NOT_FOUND")
 		return
@@ -224,13 +224,43 @@ func (s *projectService) deploy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"port": strconv.Itoa(p.DeployPort)})
 }
 
-var errProjectExists = errors.New("one project per user")
+const maxProjectsPerUser = 2
+
+var errProjectExists = errors.New("project limit reached")
 
 func (s *projectService) createProject(ctx context.Context, userID, name string) (Project, error) {
-	if _, err := s.current(ctx, userID); err == nil {
-		return Project{}, errProjectExists
-	} else if !errors.Is(err, pgx.ErrNoRows) {
+	var count int
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM projects WHERE user_id=$1`, userID).Scan(&count); err != nil {
 		return Project{}, err
+	}
+	if count >= maxProjectsPerUser {
+		return Project{}, errProjectExists
+	}
+	var portBase int
+	if err := s.db.QueryRow(ctx, `SELECT deploy_port FROM users WHERE id=$1`, userID).Scan(&portBase); err != nil {
+		return Project{}, err
+	}
+	rows, err := s.db.Query(ctx, `SELECT deploy_port FROM projects WHERE user_id=$1 AND deploy_port IS NOT NULL`, userID)
+	if err != nil {
+		return Project{}, err
+	}
+	usedPorts := make([]int, 0, count)
+	for rows.Next() {
+		var port int
+		if err := rows.Scan(&port); err != nil {
+			rows.Close()
+			return Project{}, err
+		}
+		usedPorts = append(usedPorts, port)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return Project{}, err
+	}
+	rows.Close()
+	deployPort, ok := availableProjectPort(portBase, s.cfg.DeployPortSpan, usedPorts)
+	if !ok {
+		return Project{}, errProjectExists
 	}
 	id := newID()
 	short := strings.ReplaceAll(id, "-", "")[:12]
@@ -241,7 +271,7 @@ func (s *projectService) createProject(ctx context.Context, userID, name string)
 		return Project{}, err
 	}
 	root := filepath.Join(s.cfg.ProjectRoot, userID, "projects", id)
-	p := Project{ID: id, Name: strings.TrimSpace(name), WorkspacePath: filepath.Join(root, "workspace"), CodexStatePath: filepath.Join(root, "codex"), DBSchema: schema, DBUsername: role, LastAccessedAt: time.Now().UTC()}
+	p := Project{ID: id, Name: strings.TrimSpace(name), WorkspacePath: filepath.Join(root, "workspace"), CodexStatePath: filepath.Join(root, "codex"), DBSchema: schema, DBUsername: role, LastAccessedAt: time.Now().UTC(), DeployPort: deployPort}
 	if p.Name == "" {
 		p.Name = "Untitled project"
 	}
@@ -265,7 +295,7 @@ func (s *projectService) createProject(ctx context.Context, userID, name string)
 	if err := s.createProjectDatabase(ctx, schema, role, password); err != nil {
 		return Project{}, err
 	}
-	_, err = s.db.Exec(ctx, `INSERT INTO projects(id,user_id,name,workspace_path,codex_state_path,last_accessed_at,db_schema,db_username,db_password_ciphertext) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, p.ID, userID, p.Name, p.WorkspacePath, p.CodexStatePath, p.LastAccessedAt, p.DBSchema, p.DBUsername, p.DBPasswordCiphertext)
+	_, err = s.db.Exec(ctx, `INSERT INTO projects(id,user_id,name,workspace_path,codex_state_path,last_accessed_at,db_schema,db_username,db_password_ciphertext,deploy_port) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, p.ID, userID, p.Name, p.WorkspacePath, p.CodexStatePath, p.LastAccessedAt, p.DBSchema, p.DBUsername, p.DBPasswordCiphertext, p.DeployPort)
 	if err != nil {
 		return Project{}, err
 	}
@@ -281,9 +311,37 @@ func (s *projectService) createProjectDatabase(ctx context.Context, schema, role
 }
 func quoteIdent(v string) string   { return `"` + strings.ReplaceAll(v, `"`, `""`) + `"` }
 func quoteLiteral(v string) string { return `'` + strings.ReplaceAll(v, `'`, `''`) + `'` }
-func (s *projectService) current(ctx context.Context, userID string) (Project, error) {
+func availableProjectPort(base, span int, used []int) (int, bool) {
+	occupied := make(map[int]struct{}, len(used))
+	for _, port := range used {
+		occupied[port] = struct{}{}
+	}
+	for port := base; port < base+span; port++ {
+		if _, exists := occupied[port]; !exists {
+			return port, true
+		}
+	}
+	return 0, false
+}
+func (s *projectService) list(ctx context.Context, userID string) ([]Project, error) {
+	rows, err := s.db.Query(ctx, `SELECT p.id,p.name,p.workspace_path,p.codex_state_path,p.db_schema,p.db_username,p.db_password_ciphertext,p.last_accessed_at,COALESCE(p.deploy_port,u.deploy_port,0) FROM projects p JOIN users u ON u.id=p.user_id WHERE p.user_id=$1 ORDER BY p.created_at`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Project{}
+	for rows.Next() {
+		var p Project
+		if err := rows.Scan(&p.ID, &p.Name, &p.WorkspacePath, &p.CodexStatePath, &p.DBSchema, &p.DBUsername, &p.DBPasswordCiphertext, &p.LastAccessedAt, &p.DeployPort); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+func (s *projectService) byID(ctx context.Context, userID, projectID string) (Project, error) {
 	var p Project
-	err := s.db.QueryRow(ctx, `SELECT p.id,p.name,p.workspace_path,p.codex_state_path,p.db_schema,p.db_username,p.db_password_ciphertext,p.last_accessed_at,COALESCE(u.deploy_port,0) FROM projects p JOIN users u ON u.id=p.user_id WHERE p.user_id=$1`, userID).Scan(&p.ID, &p.Name, &p.WorkspacePath, &p.CodexStatePath, &p.DBSchema, &p.DBUsername, &p.DBPasswordCiphertext, &p.LastAccessedAt, &p.DeployPort)
+	err := s.db.QueryRow(ctx, `SELECT p.id,p.name,p.workspace_path,p.codex_state_path,p.db_schema,p.db_username,p.db_password_ciphertext,p.last_accessed_at,COALESCE(p.deploy_port,u.deploy_port,0) FROM projects p JOIN users u ON u.id=p.user_id WHERE p.id=$1 AND p.user_id=$2`, projectID, userID).Scan(&p.ID, &p.Name, &p.WorkspacePath, &p.CodexStatePath, &p.DBSchema, &p.DBUsername, &p.DBPasswordCiphertext, &p.LastAccessedAt, &p.DeployPort)
 	return p, err
 }
 func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
@@ -309,6 +367,28 @@ func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
 	}
 	s.touch(ctx, p.ID)
 	return nil
+}
+func waitRuntimeReady(ctx context.Context, projectID string) error {
+	deadline := time.NewTimer(25 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(300 * time.Millisecond)
+	defer ticker.Stop()
+
+	address := net.JoinHostPort(runtimeName(projectID), "3000")
+	for {
+		conn, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "tcp", address)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return errRuntimeUnavailable
+		case <-ticker.C:
+		}
+	}
 }
 func (s *projectService) touch(ctx context.Context, id string) {
 	_, _ = s.db.Exec(ctx, `UPDATE projects SET last_accessed_at=now() WHERE id=$1 AND last_accessed_at < now() - interval '5 minutes'`, id)

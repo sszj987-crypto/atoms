@@ -23,3 +23,24 @@ func TestRuntimeName(t *testing.T) {
 		t.Fatalf("unexpected name %q", got)
 	}
 }
+
+func TestAvailableProjectPort(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		used []int
+		want int
+		ok   bool
+	}{
+		{"first port", nil, 18000, true},
+		{"next free port", []int{18000}, 18001, true},
+		{"fills gap", []int{18000, 18002}, 18001, true},
+		{"range exhausted", []int{18000, 18001}, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := availableProjectPort(18000, 2, tc.used)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("availableProjectPort() = (%d, %v), want (%d, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}

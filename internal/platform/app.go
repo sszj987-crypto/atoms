@@ -51,6 +51,22 @@ func NewApp(ctx context.Context, cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	// Each user owns a reserved port range. Keep each project's port stable so
+	// multiple project runtimes can run without binding the same host port.
+	if _, err := db.Exec(ctx, `
+		WITH ranked AS (
+			SELECT p.id, u.deploy_port + (row_number() OVER (PARTITION BY p.user_id ORDER BY p.created_at, p.id) - 1)::integer AS deploy_port
+			FROM projects p
+			JOIN users u ON u.id = p.user_id
+		)
+		UPDATE projects p
+		SET deploy_port = ranked.deploy_port
+		FROM ranked
+		WHERE p.id = ranked.id AND p.deploy_port IS NULL
+	`); err != nil {
+		db.Close()
+		return nil, err
+	}
 	model := newModelService(db, cfg.MasterKey)
 	projects := newProjectService(db, cfg, model)
 	projects.recover(ctx)
@@ -62,7 +78,7 @@ func (a *App) Close() { a.db.Close() }
 
 func (a *App) Router() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.RealIP, middleware.Logger, middleware.Recoverer, middleware.Timeout(30*time.Second))
+	r.Use(middleware.RequestID, middleware.RealIP, middleware.Logger, middleware.Recoverer)
 	r.Handle("/*", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if projectID := previewProjectID(r.Host); projectID != "" {
 			token := r.URL.Query().Get("preview_token")
@@ -100,25 +116,26 @@ func (a *App) platformHandler() http.Handler {
 		r.Post("/auth/login", a.auth.login)
 		r.Post("/auth/logout", a.auth.logout)
 		r.Group(func(r chi.Router) {
-			r.Use(a.auth.requireUser)
+			r.Use(a.auth.requireUser, middleware.Timeout(30*time.Second))
 			r.Get("/me", a.auth.me)
 			r.Get("/llm-config", a.model.get)
 			r.Put("/llm-config", a.model.put)
 			r.Post("/llm-config/test", a.model.test)
 			r.Get("/project", a.projects.get)
 			r.Post("/project", a.projects.create)
-			r.Patch("/project", a.projects.rename)
-			r.Delete("/project", a.projects.delete)
-			r.Get("/project/preview-access", a.previewAccess)
-			r.Get("/project/runtime/status", a.projects.runtimeStatus)
-			r.Post("/project/runtime/restart", a.projects.restart)
-			r.Post("/project/deploy", a.projects.deploy)
-			r.Get("/project/messages", a.chat.messages)
-			r.Post("/project/messages", a.chat.send)
+			r.Patch("/project/{id}", a.projects.rename)
+			r.Delete("/project/{id}", a.projects.delete)
+			r.Get("/project/{id}/preview-access", a.previewAccess)
+			r.Get("/project/{id}/runtime/status", a.projects.runtimeStatus)
+			r.Post("/project/{id}/runtime/restart", a.projects.restart)
+			r.Post("/project/{id}/deploy", a.projects.deploy)
+			r.Get("/project/{id}/messages", a.chat.messages)
+			r.Post("/project/{id}/messages", a.chat.send)
 			r.Get("/project/runs/{id}", a.chat.runInfo)
 			r.Post("/project/runs/{id}/cancel", a.chat.cancel)
-			r.Get("/project/runs/{id}/events", a.chat.events)
 		})
+		// SSE is long-lived (agent runs take minutes); exclude it from the request timeout.
+		r.With(a.auth.requireUser).Get("/project/runs/{id}/events", a.chat.events)
 	})
 	if web, err := staticHandler(a.cfg.WebDir); err == nil {
 		r.Mount("/", web)
@@ -132,7 +149,7 @@ func (a *App) platformHandler() http.Handler {
 
 func (a *App) previewAccess(w http.ResponseWriter, r *http.Request) {
 	u := r.Context().Value(currentUserKey{}).(User)
-	p, err := a.projects.current(r.Context(), u.ID)
+	p, err := a.projects.byID(r.Context(), u.ID, chi.URLParam(r, "id"))
 	if errors.Is(err, pgx.ErrNoRows) {
 		apiError(w, http.StatusNotFound, "PROJECT_NOT_FOUND")
 		return
@@ -145,13 +162,17 @@ func (a *App) previewAccess(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE")
 		return
 	}
+	if err := waitRuntimeReady(r.Context(), p.ID); err != nil {
+		apiError(w, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"preview_token": a.auth.signPreview(u.ID, p.ID), "port": p.DeployPort})
 }
 
 func (a *App) preview(w http.ResponseWriter, r *http.Request) {
 	projectID := previewProjectID(r.Host)
 	u := r.Context().Value(currentUserKey{}).(User)
-	p, err := a.projects.current(r.Context(), u.ID)
+	p, err := a.projects.byID(r.Context(), u.ID, projectID)
 	if err != nil || p.ID != projectID {
 		apiError(w, http.StatusNotFound, "PROJECT_NOT_FOUND")
 		return

@@ -15,10 +15,23 @@ import (
 
 type chatService struct{ projects *projectService }
 
+type runProgressEvent struct {
+	StepID string `json:"step_id,omitempty"`
+	Kind   string `json:"kind"`
+	Title  string `json:"title"`
+	Detail string `json:"detail,omitempty"`
+	Status string `json:"status,omitempty"`
+}
+
+type codexFileChange struct {
+	Path string `json:"path"`
+	Kind string `json:"kind"`
+}
+
 func newChatService(p *projectService) *chatService { return &chatService{projects: p} }
 func (s *chatService) messages(w http.ResponseWriter, r *http.Request) {
 	u := r.Context().Value(currentUserKey{}).(User)
-	p, e := s.projects.current(r.Context(), u.ID)
+	p, e := s.projects.byID(r.Context(), u.ID, chi.URLParam(r, "id"))
 	if e == pgx.ErrNoRows {
 		apiError(w, 404, "PROJECT_NOT_FOUND")
 		return
@@ -54,7 +67,7 @@ func (s *chatService) send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := r.Context().Value(currentUserKey{}).(User)
-	p, e := s.projects.current(r.Context(), u.ID)
+	p, e := s.projects.byID(r.Context(), u.ID, chi.URLParam(r, "id"))
 	if e != nil {
 		apiError(w, 404, "PROJECT_NOT_FOUND")
 		return
@@ -131,13 +144,16 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 		cmd = append(cmd, "resume", "--last")
 	}
 	cmd = append(cmd, task)
-	s.progress(ctx, runID, "Codex 正在分析并修改项目…")
+	s.progress(ctx, runID, "正在分析并修改项目…")
 	lastProgress := ""
 	out, err := s.projects.docker.execStream(ctx, runtimeName(p.ID), cmd, []string{"CODEX_HOME=/codex", "OPENAI_API_KEY=" + key}, func(line []byte) {
-		message := codexProgress(line)
-		if message != "" && message != lastProgress {
-			lastProgress = message
-			s.progress(ctx, runID, message)
+		event, ok := codexProgress(line, key)
+		if ok {
+			key := event.progressKey()
+			if key != lastProgress {
+				lastProgress = key
+				s.progressEvent(ctx, runID, event)
+			}
 		}
 	})
 	// Execution logs are retained for diagnosis but must never persist the provider key.
@@ -150,14 +166,14 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 	for repair := 0; repair <= 2; repair++ {
 		_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='VERIFYING' WHERE id=$1`, runID)
 		s.progress(ctx, runID, "正在验证类型、测试、构建和预览…")
-		if verifyErr := s.verify(ctx, p); verifyErr == nil {
+		if verifyErr := s.verify(ctx, p, runID); verifyErr == nil {
 			break
 		} else if repair == 2 {
 			s.fail(ctx, runID, "Verification failed after repair attempts.")
 			return
 		} else {
 			_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='REPAIRING' WHERE id=$1`, runID)
-			s.progress(ctx, runID, "验证未通过，Codex 正在修复…")
+			s.progress(ctx, runID, "验证未通过，正在自动修复…")
 			fix := []string{"codex", "exec", "resume", "--last", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "Fix the verification failure: " + verifyErr.Error() + ". Then rerun the required checks."}
 			if _, err := s.projects.docker.exec(ctx, runtimeName(p.ID), fix, []string{"CODEX_HOME=/codex", "OPENAI_API_KEY=" + key}); err != nil {
 				s.fail(ctx, runID, "Automatic repair failed.")
@@ -173,11 +189,28 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 	_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='COMPLETED',finished_at=now() WHERE id=$1 AND status <> 'CANCELLED'`, runID)
 	s.progress(ctx, runID, "已完成。")
 }
-func (s *chatService) verify(ctx context.Context, p Project) error {
-	for _, cmd := range [][]string{{"sh", "-lc", "pnpm typecheck"}, {"sh", "-lc", "pnpm test"}, {"sh", "-lc", "pnpm build"}, {"sh", "-lc", "curl -fsS http://127.0.0.1:3000/ >/dev/null"}} {
-		if _, err := s.projects.docker.exec(ctx, runtimeName(p.ID), cmd, nil); err != nil {
-			return fmt.Errorf("%s", cmd[2])
+func (s *chatService) verify(ctx context.Context, p Project, runID string) error {
+	checks := []struct {
+		id      string
+		title   string
+		command string
+	}{
+		{"typecheck", "TypeScript 类型检查", "pnpm typecheck"},
+		{"test", "自动化测试", "pnpm test"},
+		{"build", "生产版本构建", "pnpm build"},
+		{"smoke", "预览页面检查", "curl -fsS http://127.0.0.1:3000/ >/dev/null"},
+	}
+	for _, check := range checks {
+		event := runProgressEvent{StepID: "verify-" + check.id, Kind: "verify", Title: check.title, Detail: check.command, Status: "running"}
+		s.progressEvent(ctx, runID, event)
+		if _, err := s.projects.docker.exec(ctx, runtimeName(p.ID), []string{"sh", "-lc", check.command}, nil); err != nil {
+			event.Status = "failed"
+			event.Detail = "执行失败：" + check.command
+			s.progressEvent(ctx, runID, event)
+			return fmt.Errorf("%s", check.command)
 		}
+		event.Status = "completed"
+		s.progressEvent(ctx, runID, event)
 	}
 	return nil
 }
@@ -186,41 +219,203 @@ func (s *chatService) fail(ctx context.Context, id, msg string) {
 	s.progress(ctx, id, msg)
 }
 func (s *chatService) progress(ctx context.Context, runID, message string) {
-	message = strings.TrimSpace(message)
-	if message == "" {
+	s.progressEvent(ctx, runID, runProgressEvent{Kind: "info", Title: publicProgressText(message)})
+}
+func (s *chatService) progressEvent(ctx context.Context, runID string, event runProgressEvent) {
+	event.Title = strings.TrimSpace(event.Title)
+	event.Detail = strings.TrimSpace(event.Detail)
+	if event.Title == "" {
 		return
 	}
-	_, _ = s.projects.db.Exec(ctx, `INSERT INTO agent_run_events(run_id,content) VALUES($1,$2)`, runID, message)
+	if event.Kind == "" {
+		event.Kind = "info"
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		return
+	}
+	_, _ = s.projects.db.Exec(ctx, `INSERT INTO agent_run_events(run_id,content) VALUES($1,$2)`, runID, string(raw))
 }
-func codexProgress(line []byte) string {
+func (event runProgressEvent) progressKey() string {
+	return event.StepID + "\x00" + event.Kind + "\x00" + event.Title + "\x00" + event.Detail + "\x00" + event.Status
+}
+func codexProgress(line []byte, secrets ...string) (runProgressEvent, bool) {
 	var event struct {
 		Type string `json:"type"`
 		Item struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			ID               string            `json:"id"`
+			Type             string            `json:"type"`
+			Text             string            `json:"text"`
+			Message          string            `json:"message"`
+			Command          string            `json:"command"`
+			AggregatedOutput string            `json:"aggregated_output"`
+			ExitCode         *int              `json:"exit_code"`
+			Status           string            `json:"status"`
+			Changes          []codexFileChange `json:"changes"`
 		} `json:"item"`
 	}
 	if json.Unmarshal(line, &event) != nil {
-		return ""
+		return runProgressEvent{}, false
 	}
 	switch event.Type {
 	case "thread.started", "turn.started":
-		return "Codex 正在开始处理请求…"
+		return runProgressEvent{StepID: "run-start", Kind: "analysis", Title: "开始处理请求", Status: "running"}, true
 	case "item.started", "item.updated", "item.completed":
+		status := progressStatus(event.Type, event.Item.Status, event.Item.ExitCode)
 		switch event.Item.Type {
 		case "reasoning":
-			return "Codex 正在分析实现方案…"
+			if event.Type == "item.updated" {
+				return runProgressEvent{}, false
+			}
+			return runProgressEvent{StepID: event.Item.ID, Kind: "analysis", Title: "分析实现方案", Status: status}, true
 		case "command_execution":
-			return "Codex 正在检查或执行项目命令…"
+			title, detail := describeCommand(event.Item.Command)
+			if status == "failed" && event.Item.ExitCode != nil {
+				detail = appendDetail(detail, fmt.Sprintf("退出码 %d", *event.Item.ExitCode))
+				if title == "检查 TypeScript 类型" || title == "运行自动化测试" || title == "构建生产版本" {
+					detail = appendDetail(detail, safeCommandOutput(event.Item.AggregatedOutput, secrets...))
+				}
+			}
+			return runProgressEvent{StepID: event.Item.ID, Kind: "command", Title: title, Detail: detail, Status: status}, true
 		case "file_change":
-			return "Codex 正在修改项目文件…"
+			title, detail := describeFileChanges(event.Item.Changes)
+			return runProgressEvent{StepID: event.Item.ID, Kind: "file", Title: title, Detail: detail, Status: status}, title != ""
 		case "agent_message":
 			if event.Type == "item.completed" && strings.TrimSpace(event.Item.Text) != "" {
-				return "Codex 已完成一轮处理。"
+				return runProgressEvent{StepID: event.Item.ID, Kind: "message", Title: truncateProgress(publicProgressText(event.Item.Text), 220), Status: "completed"}, true
+			}
+		case "error":
+			if event.Type == "item.completed" && strings.TrimSpace(event.Item.Message) != "" {
+				if strings.Contains(strings.ToLower(event.Item.Message), "defaulting to fallback metadata") {
+					return runProgressEvent{}, false
+				}
+				return runProgressEvent{StepID: event.Item.ID, Kind: "error", Title: truncateProgress(publicProgressText(event.Item.Message), 220), Status: "failed"}, true
 			}
 		}
 	}
+	return runProgressEvent{}, false
+}
+func progressStatus(eventType, itemStatus string, exitCode *int) string {
+	if eventType == "item.started" || itemStatus == "in_progress" {
+		return "running"
+	}
+	if exitCode != nil && *exitCode != 0 || itemStatus == "failed" {
+		return "failed"
+	}
+	return "completed"
+}
+func describeCommand(command string) (string, string) {
+	detail := safeCommandDetail(command)
+	lower := strings.ToLower(detail)
+	switch {
+	case strings.Contains(lower, "pnpm typecheck") || strings.Contains(lower, "tsc --noemit") || strings.Contains(lower, "tsc --no-emit"):
+		return "检查 TypeScript 类型", detail
+	case strings.Contains(lower, "pnpm test") || strings.Contains(lower, "vitest"):
+		return "运行自动化测试", detail
+	case strings.Contains(lower, "pnpm build") || strings.Contains(lower, "next build"):
+		return "构建生产版本", detail
+	case strings.Contains(lower, "curl ") || strings.Contains(lower, "wget "):
+		return "检查预览页面", detail
+	case strings.Contains(lower, "mkdir "):
+		return "创建项目目录", detail
+	case strings.Contains(lower, "cat >") || strings.Contains(lower, "apply_patch") || strings.Contains(lower, " tee "):
+		return "写入项目文件", detail
+	case strings.HasPrefix(lower, "pwd") || strings.Contains(lower, " ls ") || strings.HasPrefix(lower, "ls ") || strings.Contains(lower, "find ") || strings.Contains(lower, " cat ") || strings.HasPrefix(lower, "cat ") || strings.Contains(lower, "sed ") || strings.Contains(lower, "rg ") || strings.Contains(lower, "grep "):
+		return "检查项目文件", detail
+	case detail == "":
+		return "执行项目命令", ""
+	default:
+		return "执行项目命令", detail
+	}
+}
+func safeCommandDetail(command string) string {
+	command = strings.TrimSpace(command)
+	for _, prefix := range []string{"/bin/sh -lc ", "sh -lc "} {
+		command = strings.TrimPrefix(command, prefix)
+	}
+	command = strings.TrimSpace(command)
+	if len(command) >= 2 && ((command[0] == '\'' && command[len(command)-1] == '\'') || (command[0] == '"' && command[len(command)-1] == '"')) {
+		command = command[1 : len(command)-1]
+	}
+	if index := strings.Index(command, "<<"); index >= 0 {
+		command = strings.TrimSpace(command[:index]) + " << …"
+	}
+	if index := strings.IndexByte(command, '\n'); index >= 0 {
+		command = command[:index] + " …"
+	}
+	command = strings.ReplaceAll(command, "/workspace/", "")
+	command = strings.ReplaceAll(command, "/workspace", ".")
+	if containsSensitive(command) {
+		return "受保护的项目命令"
+	}
+	return truncateProgress(publicProgressText(command), 180)
+}
+func safeCommandOutput(output string, secrets ...string) string {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		if line == "" || containsSensitive(line, secrets...) {
+			continue
+		}
+		return "错误摘要：" + truncateProgress(publicProgressText(line), 180)
+	}
 	return ""
+}
+func containsSensitive(value string, secrets ...string) bool {
+	lower := strings.ToLower(value)
+	for _, secret := range secrets {
+		if secret != "" && strings.Contains(value, secret) {
+			return true
+		}
+	}
+	for _, marker := range []string{"api_key", "api key", "authorization", "password", "secret", "access_token", "database_url", "postgres://", "dbname=", "password=", "sk-"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+func describeFileChanges(changes []codexFileChange) (string, string) {
+	if len(changes) == 0 {
+		return "更新项目文件", ""
+	}
+	paths := make([]string, 0, len(changes))
+	for _, change := range changes {
+		path := strings.TrimPrefix(filepath.Clean(change.Path), "/workspace/")
+		verb := map[string]string{"add": "新增", "create": "新增", "update": "修改", "delete": "删除"}[change.Kind]
+		if verb == "" {
+			verb = "更新"
+		}
+		paths = append(paths, verb+" "+path)
+	}
+	if len(paths) == 1 {
+		return paths[0], ""
+	}
+	detailPaths := paths
+	if len(detailPaths) > 5 {
+		detailPaths = append(detailPaths[:5], fmt.Sprintf("另有 %d 个文件", len(paths)-5))
+	}
+	return fmt.Sprintf("更新 %d 个项目文件", len(paths)), strings.Join(detailPaths, " · ")
+}
+func appendDetail(current, extra string) string {
+	if strings.TrimSpace(extra) == "" {
+		return current
+	}
+	if strings.TrimSpace(current) == "" {
+		return extra
+	}
+	return current + " · " + extra
+}
+func publicProgressText(value string) string {
+	return strings.NewReplacer("Codex", "系统", "codex", "系统").Replace(strings.TrimSpace(value))
+}
+func truncateProgress(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit-1]) + "…"
 }
 func hasSession(root string) bool {
 	found := false
@@ -268,7 +463,17 @@ func (s *chatService) events(w http.ResponseWriter, r *http.Request) {
 				var createdAt any
 				if rows.Scan(&id, &content, &createdAt) == nil {
 					lastEventID = id
-					raw, _ := json.Marshal(map[string]any{"content": content, "created_at": createdAt})
+					payload := map[string]any{"id": id, "content": content, "created_at": createdAt, "kind": "info", "title": content}
+					var event runProgressEvent
+					if json.Unmarshal([]byte(content), &event) == nil && strings.TrimSpace(event.Title) != "" {
+						payload["step_id"] = event.StepID
+						payload["kind"] = event.Kind
+						payload["title"] = event.Title
+						payload["detail"] = event.Detail
+						payload["status"] = event.Status
+						payload["content"] = event.Title
+					}
+					raw, _ := json.Marshal(payload)
 					fmt.Fprintf(w, "event: progress\ndata: %s\n\n", raw)
 				}
 			}
@@ -301,8 +506,10 @@ func (s *chatService) cancel(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 500, "RUN_CANCEL_FAILED")
 		return
 	}
-	p, _ := s.projects.current(r.Context(), r.Context().Value(currentUserKey{}).(User).ID)
-	go s.projects.docker.exec(context.Background(), runtimeName(p.ID), []string{"sh", "-lc", "pkill -f 'codex exec' || true"}, nil)
+	var projectID string
+	if err := s.projects.db.QueryRow(r.Context(), `SELECT project_id FROM agent_runs WHERE id=$1`, run.ID).Scan(&projectID); err == nil {
+		go s.projects.docker.exec(context.Background(), runtimeName(projectID), []string{"sh", "-lc", "pkill -f 'codex exec' || true"}, nil)
+	}
 	writeJSON(w, 200, map[string]string{"status": "CANCELLED"})
 }
 
@@ -316,13 +523,8 @@ type runView struct {
 
 func (s *chatService) ownedRun(w http.ResponseWriter, r *http.Request) (runView, bool) {
 	u := r.Context().Value(currentUserKey{}).(User)
-	p, e := s.projects.current(r.Context(), u.ID)
-	if e != nil {
-		apiError(w, 404, "PROJECT_NOT_FOUND")
-		return runView{}, false
-	}
 	var v runView
-	e = s.projects.db.QueryRow(r.Context(), `SELECT id,status,error_message,started_at,finished_at FROM agent_runs WHERE id=$1 AND project_id=$2`, chi.URLParam(r, "id"), p.ID).Scan(&v.ID, &v.Status, &v.ErrorMessage, &v.StartedAt, &v.FinishedAt)
+	e := s.projects.db.QueryRow(r.Context(), `SELECT r.id,r.status,r.error_message,r.started_at,r.finished_at FROM agent_runs r JOIN projects p ON p.id=r.project_id WHERE r.id=$1 AND p.user_id=$2`, chi.URLParam(r, "id"), u.ID).Scan(&v.ID, &v.Status, &v.ErrorMessage, &v.StartedAt, &v.FinishedAt)
 	if e != nil {
 		apiError(w, 404, "RUN_NOT_FOUND")
 		return runView{}, false

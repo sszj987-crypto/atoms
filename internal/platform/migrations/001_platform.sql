@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS llm_configs (
 
 CREATE TABLE IF NOT EXISTS projects (
   id UUID PRIMARY KEY,
-  user_id UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   workspace_path TEXT NOT NULL,
   codex_state_path TEXT NOT NULL,
@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE projects DROP CONSTRAINT IF EXISTS projects_user_id_key;
 
 CREATE TABLE IF NOT EXISTS messages (
   id UUID PRIMARY KEY,
