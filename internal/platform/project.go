@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -37,14 +39,16 @@ type Project struct {
 	DeployPort           int       `json:"-"`
 }
 type projectService struct {
-	db     *pgxpool.Pool
-	cfg    Config
-	docker *dockerClient
-	model  *modelService
+	db           *pgxpool.Pool
+	cfg          Config
+	docker       *dockerClient
+	model        *modelService
+	mu           sync.Mutex
+	runtimeLocks map[string]*sync.Mutex
 }
 
 func newProjectService(db *pgxpool.Pool, cfg Config, model *modelService) *projectService {
-	return &projectService{db: db, cfg: cfg, docker: newDockerClient(), model: model}
+	return &projectService{db: db, cfg: cfg, docker: newDockerClient(), model: model, runtimeLocks: make(map[string]*sync.Mutex)}
 }
 
 func (s *projectService) get(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +71,15 @@ func (s *projectService) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := r.Context().Value(currentUserKey{}).(User)
+	allowed, err := s.canCreateProject(r.Context(), u.ID)
+	if err != nil {
+		apiError(w, 500, "PROJECT_READ_FAILED")
+		return
+	}
+	if !allowed {
+		apiError(w, 409, "PROJECT_LIMIT_REACHED")
+		return
+	}
 	name, err := s.model.projectTitle(r.Context(), u.ID, input.Description)
 	if errors.Is(err, errModelConfigRequired) {
 		apiError(w, 400, "MODEL_CONFIG_REQUIRED")
@@ -128,8 +141,18 @@ func (s *projectService) delete(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, "PROJECT_READ_FAILED")
 		return
 	}
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, "PROJECT_DELETE_FAILED")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtext($1))`, p.ID); err != nil {
+		apiError(w, http.StatusInternalServerError, "PROJECT_DELETE_FAILED")
+		return
+	}
 	var active bool
-	if err := s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, p.ID).Scan(&active); err != nil {
+	if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, p.ID).Scan(&active); err != nil {
 		apiError(w, http.StatusInternalServerError, "PROJECT_DELETE_FAILED")
 		return
 	}
@@ -137,19 +160,23 @@ func (s *projectService) delete(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusConflict, "RUN_IN_PROGRESS")
 		return
 	}
-	if err := s.docker.remove(r.Context(), runtimeName(p.ID)); err != nil {
+	if err := s.removeRuntime(r.Context(), p.ID); err != nil {
 		apiError(w, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE")
 		return
 	}
-	if _, err := s.db.Exec(r.Context(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quoteIdent(p.DBSchema))); err != nil {
+	if _, err := tx.Exec(r.Context(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quoteIdent(p.DBSchema))); err != nil {
 		apiError(w, http.StatusInternalServerError, "PROJECT_DELETE_FAILED")
 		return
 	}
-	if _, err := s.db.Exec(r.Context(), fmt.Sprintf("DROP ROLE IF EXISTS %s", quoteIdent(p.DBUsername))); err != nil {
+	if _, err := tx.Exec(r.Context(), fmt.Sprintf("DROP ROLE IF EXISTS %s", quoteIdent(p.DBUsername))); err != nil {
 		apiError(w, http.StatusInternalServerError, "PROJECT_DELETE_FAILED")
 		return
 	}
-	if _, err := s.db.Exec(r.Context(), `DELETE FROM projects WHERE id=$1 AND user_id=$2`, p.ID, u.ID); err != nil {
+	if _, err := tx.Exec(r.Context(), `DELETE FROM projects WHERE id=$1 AND user_id=$2`, p.ID, u.ID); err != nil {
+		apiError(w, http.StatusInternalServerError, "PROJECT_DELETE_FAILED")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
 		apiError(w, http.StatusInternalServerError, "PROJECT_DELETE_FAILED")
 		return
 	}
@@ -157,8 +184,7 @@ func (s *projectService) delete(w http.ResponseWriter, r *http.Request) {
 	expectedPrefix := filepath.Join(filepath.Clean(s.cfg.ProjectRoot), u.ID, "projects") + string(filepath.Separator)
 	if strings.HasPrefix(root+string(filepath.Separator), expectedPrefix) {
 		if err := os.RemoveAll(root); err != nil {
-			apiError(w, http.StatusInternalServerError, "PROJECT_DELETE_FAILED")
-			return
+			log.Printf("project cleanup failed project_id=%s: %v", p.ID, err)
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -191,11 +217,16 @@ func (s *projectService) restart(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 500, "PROJECT_READ_FAILED")
 		return
 	}
-	if err = s.docker.remove(r.Context(), runtimeName(p.ID)); err != nil {
-		apiError(w, 503, "RUNTIME_UNAVAILABLE")
+	active, err := s.hasActiveRun(r.Context(), p.ID)
+	if err != nil {
+		apiError(w, 500, "RUN_READ_FAILED")
 		return
 	}
-	if err = s.ensureRuntime(r.Context(), p); err != nil {
+	if active {
+		apiError(w, 409, "RUN_IN_PROGRESS")
+		return
+	}
+	if err = s.recreateRuntime(r.Context(), p); err != nil {
 		apiError(w, 503, "RUNTIME_UNAVAILABLE")
 		return
 	}
@@ -211,13 +242,16 @@ func (s *projectService) deploy(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 500, "PROJECT_READ_FAILED")
 		return
 	}
-	// Recreate so the container is always created with the published deploy port,
-	// even if a pre-deploy runtime (no port) is already running.
-	if err := s.docker.remove(r.Context(), runtimeName(p.ID)); err != nil {
-		apiError(w, 503, "RUNTIME_UNAVAILABLE")
+	active, err := s.hasActiveRun(r.Context(), p.ID)
+	if err != nil {
+		apiError(w, 500, "RUN_READ_FAILED")
 		return
 	}
-	if err := s.ensureRuntime(r.Context(), p); err != nil {
+	if active {
+		apiError(w, 409, "RUN_IN_PROGRESS")
+		return
+	}
+	if err := s.recreateRuntime(r.Context(), p); err != nil {
 		apiError(w, 503, "RUNTIME_UNAVAILABLE")
 		return
 	}
@@ -228,40 +262,15 @@ const maxProjectsPerUser = 2
 
 var errProjectExists = errors.New("project limit reached")
 
-func (s *projectService) createProject(ctx context.Context, userID, name string) (Project, error) {
+func (s *projectService) canCreateProject(ctx context.Context, userID string) (bool, error) {
 	var count int
 	if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM projects WHERE user_id=$1`, userID).Scan(&count); err != nil {
-		return Project{}, err
+		return false, err
 	}
-	if count >= maxProjectsPerUser {
-		return Project{}, errProjectExists
-	}
-	var portBase int
-	if err := s.db.QueryRow(ctx, `SELECT deploy_port FROM users WHERE id=$1`, userID).Scan(&portBase); err != nil {
-		return Project{}, err
-	}
-	rows, err := s.db.Query(ctx, `SELECT deploy_port FROM projects WHERE user_id=$1 AND deploy_port IS NOT NULL`, userID)
-	if err != nil {
-		return Project{}, err
-	}
-	usedPorts := make([]int, 0, count)
-	for rows.Next() {
-		var port int
-		if err := rows.Scan(&port); err != nil {
-			rows.Close()
-			return Project{}, err
-		}
-		usedPorts = append(usedPorts, port)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return Project{}, err
-	}
-	rows.Close()
-	deployPort, ok := availableProjectPort(portBase, s.cfg.DeployPortSpan, usedPorts)
-	if !ok {
-		return Project{}, errProjectExists
-	}
+	return count < maxProjectsPerUser, nil
+}
+
+func (s *projectService) createProject(ctx context.Context, userID, name string) (Project, error) {
 	id := newID()
 	short := strings.ReplaceAll(id, "-", "")[:12]
 	schema := "p_" + short
@@ -271,7 +280,13 @@ func (s *projectService) createProject(ctx context.Context, userID, name string)
 		return Project{}, err
 	}
 	root := filepath.Join(s.cfg.ProjectRoot, userID, "projects", id)
-	p := Project{ID: id, Name: strings.TrimSpace(name), WorkspacePath: filepath.Join(root, "workspace"), CodexStatePath: filepath.Join(root, "codex"), DBSchema: schema, DBUsername: role, LastAccessedAt: time.Now().UTC(), DeployPort: deployPort}
+	created := false
+	defer func() {
+		if !created {
+			_ = os.RemoveAll(root)
+		}
+	}()
+	p := Project{ID: id, Name: strings.TrimSpace(name), WorkspacePath: filepath.Join(root, "workspace"), CodexStatePath: filepath.Join(root, "codex"), DBSchema: schema, DBUsername: role, LastAccessedAt: time.Now().UTC()}
 	if p.Name == "" {
 		p.Name = "Untitled project"
 	}
@@ -292,21 +307,65 @@ func (s *projectService) createProject(ctx context.Context, userID, name string)
 		return Project{}, err
 	}
 	p.DBPasswordCiphertext = sealed
-	if err := s.createProjectDatabase(ctx, schema, role, password); err != nil {
-		return Project{}, err
-	}
-	_, err = s.db.Exec(ctx, `INSERT INTO projects(id,user_id,name,workspace_path,codex_state_path,last_accessed_at,db_schema,db_username,db_password_ciphertext,deploy_port) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, p.ID, userID, p.Name, p.WorkspacePath, p.CodexStatePath, p.LastAccessedAt, p.DBSchema, p.DBUsername, p.DBPasswordCiphertext, p.DeployPort)
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return Project{}, err
 	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, userID); err != nil {
+		return Project{}, err
+	}
+	var count, portBase int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM projects WHERE user_id=$1`, userID).Scan(&count); err != nil {
+		return Project{}, err
+	}
+	if count >= maxProjectsPerUser {
+		return Project{}, errProjectExists
+	}
+	if err := tx.QueryRow(ctx, `SELECT deploy_port FROM users WHERE id=$1`, userID).Scan(&portBase); err != nil {
+		return Project{}, err
+	}
+	rows, err := tx.Query(ctx, `SELECT deploy_port FROM projects WHERE user_id=$1 AND deploy_port IS NOT NULL`, userID)
+	if err != nil {
+		return Project{}, err
+	}
+	usedPorts := make([]int, 0, count)
+	for rows.Next() {
+		var port int
+		if err := rows.Scan(&port); err != nil {
+			rows.Close()
+			return Project{}, err
+		}
+		usedPorts = append(usedPorts, port)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return Project{}, err
+	}
+	rows.Close()
+	var ok bool
+	p.DeployPort, ok = availableProjectPort(portBase, s.cfg.DeployPortSpan, usedPorts)
+	if !ok {
+		return Project{}, errProjectExists
+	}
+	if err := s.createProjectDatabase(ctx, tx, schema, role, password); err != nil {
+		return Project{}, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO projects(id,user_id,name,workspace_path,codex_state_path,last_accessed_at,db_schema,db_username,db_password_ciphertext,deploy_port) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, p.ID, userID, p.Name, p.WorkspacePath, p.CodexStatePath, p.LastAccessedAt, p.DBSchema, p.DBUsername, p.DBPasswordCiphertext, p.DeployPort); err != nil {
+		return Project{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Project{}, err
+	}
+	created = true
 	return p, nil
 }
-func (s *projectService) createProjectDatabase(ctx context.Context, schema, role, password string) error {
-	_, err := s.db.Exec(ctx, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD %s", quoteIdent(role), quoteLiteral(password)))
+func (s *projectService) createProjectDatabase(ctx context.Context, tx pgx.Tx, schema, role, password string) error {
+	_, err := tx.Exec(ctx, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD %s", quoteIdent(role), quoteLiteral(password)))
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %s AUTHORIZATION %s", quoteIdent(schema), quoteIdent(role)))
+	_, err = tx.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %s AUTHORIZATION %s", quoteIdent(schema), quoteIdent(role)))
 	return err
 }
 func quoteIdent(v string) string   { return `"` + strings.ReplaceAll(v, `"`, `""`) + `"` }
@@ -345,6 +404,12 @@ func (s *projectService) byID(ctx context.Context, userID, projectID string) (Pr
 	return p, err
 }
 func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
+	lock := s.runtimeLock(p.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	return s.ensureRuntimeLocked(ctx, p)
+}
+func (s *projectService) ensureRuntimeLocked(ctx context.Context, p Project) error {
 	status, err := s.docker.inspect(ctx, runtimeName(p.ID))
 	if err != nil {
 		return err
@@ -367,6 +432,36 @@ func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
 	}
 	s.touch(ctx, p.ID)
 	return nil
+}
+func (s *projectService) recreateRuntime(ctx context.Context, p Project) error {
+	lock := s.runtimeLock(p.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := s.docker.remove(ctx, runtimeName(p.ID)); err != nil {
+		return err
+	}
+	return s.ensureRuntimeLocked(ctx, p)
+}
+func (s *projectService) removeRuntime(ctx context.Context, projectID string) error {
+	lock := s.runtimeLock(projectID)
+	lock.Lock()
+	defer lock.Unlock()
+	return s.docker.remove(ctx, runtimeName(projectID))
+}
+func (s *projectService) runtimeLock(projectID string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock := s.runtimeLocks[projectID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.runtimeLocks[projectID] = lock
+	}
+	return lock
+}
+func (s *projectService) hasActiveRun(ctx context.Context, projectID string) (bool, error) {
+	var active bool
+	err := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, projectID).Scan(&active)
+	return active, err
 }
 func waitRuntimeReady(ctx context.Context, projectID string) error {
 	deadline := time.NewTimer(25 * time.Second)
@@ -404,7 +499,7 @@ func (s *projectService) cleanup(ctx context.Context) error {
 		if err := rows.Scan(&id); err != nil {
 			return err
 		}
-		if err := s.docker.remove(ctx, runtimeName(id)); err != nil {
+		if err := s.removeRuntime(ctx, id); err != nil {
 			return err
 		}
 	}
@@ -419,22 +514,30 @@ func (s *projectService) startCleanup(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = s.cleanup(ctx)
+				if err := s.cleanup(ctx); err != nil && ctx.Err() == nil {
+					log.Printf("runtime cleanup failed: %v", err)
+				}
 			}
 		}
 	}()
 }
-func (s *projectService) recover(ctx context.Context) {
+func (s *projectService) recover(ctx context.Context) error {
 	ids, err := s.docker.managedProjectIDs(ctx)
 	if err != nil {
-		return
+		return err
 	}
 	for _, id := range ids {
 		var exists bool
-		if s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1)`, id).Scan(&exists) == nil && !exists {
-			_ = s.docker.remove(ctx, runtimeName(id))
+		if err := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1)`, id).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			if err := s.removeRuntime(ctx, id); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 func durationInterval(v time.Duration) string { return fmt.Sprintf("%d seconds", int64(v.Seconds())) }
 func randomSecret() (string, error) {

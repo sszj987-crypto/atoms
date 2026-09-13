@@ -1,6 +1,21 @@
 package platform
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+func TestActiveRunConflict(t *testing.T) {
+	conflict := &pgconn.PgError{Code: "23505", ConstraintName: "agent_runs_one_active_per_project"}
+	if !activeRunConflict(conflict) || !activeRunConflict(errors.Join(errors.New("insert failed"), conflict)) {
+		t.Fatal("expected the active-run unique constraint to be recognized")
+	}
+	if activeRunConflict(&pgconn.PgError{Code: "23505", ConstraintName: "projects_deploy_port_key"}) {
+		t.Fatal("unrelated unique constraint must not be treated as an active-run conflict")
+	}
+}
 
 func TestExtractSummary(t *testing.T) {
 	raw := []byte(`{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"先看看结构。"}}

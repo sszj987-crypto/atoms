@@ -65,7 +65,15 @@ func LoadConfig() (Config, error) {
 	if network == "" {
 		network = "atoms-internal"
 	}
-	return Config{DatabaseURL: db, MasterKey: key, SessionKey: sessionKey, Port: port, WebDir: webDir, ProjectRoot: projectRoot, RuntimeImage: image, RuntimeCPU: 2, RuntimeMemoryBytes: 2 << 30, RuntimePIDs: 256, RuntimeIdleTTL: 24 * time.Hour, RuntimeSweepInterval: 15 * time.Minute, DataVolumeName: volume, RuntimeNetwork: network, DeployPortBase: envInt("DEPLOY_PORT_BASE", 18000), DeployPortSpan: envInt("DEPLOY_PORT_SPAN", 5)}, nil
+	deployPortBase := envInt("DEPLOY_PORT_BASE", 18000)
+	deployPortSpan := envInt("DEPLOY_PORT_SPAN", 5)
+	if deployPortSpan < maxProjectsPerUser {
+		return Config{}, fmt.Errorf("DEPLOY_PORT_SPAN must be at least %d", maxProjectsPerUser)
+	}
+	if deployPortBase > 65535 || deployPortSpan > 65535-deployPortBase+1 {
+		return Config{}, fmt.Errorf("deployment port range must stay within 1-65535")
+	}
+	return Config{DatabaseURL: db, MasterKey: key, SessionKey: sessionKey, Port: port, WebDir: webDir, ProjectRoot: projectRoot, RuntimeImage: image, RuntimeCPU: 2, RuntimeMemoryBytes: 2 << 30, RuntimePIDs: 256, RuntimeIdleTTL: 24 * time.Hour, RuntimeSweepInterval: 15 * time.Minute, DataVolumeName: volume, RuntimeNetwork: network, DeployPortBase: deployPortBase, DeployPortSpan: deployPortSpan}, nil
 }
 
 func envInt(name string, def int) int {

@@ -11,7 +11,7 @@ func TestCopyStarter(t *testing.T) {
 	if err := copyStarter(dir); err != nil {
 		t.Fatal(err)
 	}
-	for _, file := range []string{"package.json", "app/page.tsx", "app/api/health/route.ts", "components/inspector.tsx", "test/db.ts"} {
+	for _, file := range []string{"package.json", "pnpm-lock.yaml", "app/page.tsx", "app/api/health/route.ts", "components/inspector.tsx", "test/db.ts"} {
 		if _, err := os.Stat(filepath.Join(dir, file)); err != nil {
 			t.Fatalf("missing starter file %s: %v", file, err)
 		}

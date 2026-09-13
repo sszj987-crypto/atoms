@@ -1,6 +1,7 @@
 services:
   atoms-app:
     build: .
+    restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
@@ -25,9 +26,16 @@ services:
         condition: service_healthy
       runtime-image:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/api/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
 
   postgres:
     image: postgres:17
+    restart: unless-stopped
     environment:
       POSTGRES_DB: atoms
       POSTGRES_USER: atoms

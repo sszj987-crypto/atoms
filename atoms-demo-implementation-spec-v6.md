@@ -71,7 +71,7 @@ Point & Edit
   - API Key
   - Model
 - 模型配置测试。
-- 每个用户只能拥有一个项目。
+- 每个用户最多拥有两个项目。
 - 项目源码物理目录隔离。
 - 每个项目最多一个 Runtime Container。
 - 每个项目绑定一个长期 Codex Session。
@@ -248,7 +248,7 @@ Generated App 默认限制：
                   │ Project Service  │
                   │ Codex Control    │
                   │ Runtime Manager  │
-                  │ Preview Proxy    │
+                  │ Published Preview│
                   │ Cleanup Worker   │
                   └──────┬─────┬────┘
                          │     │
@@ -1266,40 +1266,17 @@ Codex 的主要工作应该集中在：
 
 # 29. Preview
 
-只暴露宿主机：
-
-```text
-8080
-```
-
-推荐：
+Platform 控制面暴露宿主机端口 `8080`。每个用户获得一个连续的宿主机端口段，每个项目从中获得一个稳定且唯一的端口；Runtime 的 `3000` 端口直接发布到该宿主机端口。
 
 ```text
 Platform:
 http://localhost:8080
 
-Preview:
-http://p-<project_id>.localhost:8080
+Project Preview / New Tab:
+http://localhost:<project_deploy_port>
 ```
 
-Go Server 按 Host 路由：
-
-```text
-localhost
-→ Platform
-
-p-*.localhost
-→ Runtime :3000
-```
-
-Preview Proxy 支持：
-
-```text
-HTTP
-WebSocket Upgrade
-```
-
-Runtime 不直接 publish 宿主机端口。
+工作区内嵌 Preview 和“新标签页打开”必须加载完全相同的宿主机 IP/域名与项目端口。工作区显示只读地址栏，不允许在其中修改 URL。
 
 ---
 
@@ -1586,10 +1563,10 @@ Current Project
 └─────────────────────────────────────┘
 ```
 
-由于 P0 每个用户只能拥有一个项目：
+由于 P0 每个用户最多拥有两个项目：
 
 - 用户输入明显属于当前项目的修改要求：直接继续当前项目。
-- 用户尝试创建第二个全新项目：提示当前版本仅支持一个项目，可继续修改当前项目，或删除当前项目后重新创建。
+- 用户尝试创建第三个全新项目：提示当前版本最多支持两个项目，可继续修改现有项目，或删除项目后重新创建。
 
 Home 的核心目标是：
 
@@ -1599,9 +1576,9 @@ Home 的核心目标是：
 
 ## 35.3 Projects
 
-Projects 页面必须保留，即使 P0 当前只允许一个项目。
+Projects 页面必须保留，用于承载 P0 最多两个项目的管理入口。
 
-这样信息架构不会因为当前限制被做死，未来解除一用户一项目约束时无需重构导航。
+这样信息架构不会因为当前数量限制被做死，未来提高项目上限时无需重构导航。
 
 页面：
 
@@ -1826,14 +1803,14 @@ Model Test
 实现：
 
 ```text
-one user → one project
+one user → up to two projects
 user/project directory
 starter template
 project DB schema + role
 runtime container
 2 GiB / 2 CPU
 internal network
-preview proxy
+published project preview
 24h cleanup
 runtime restore
 ```
@@ -1962,7 +1939,7 @@ Clean Install Verification
 password
 secret encryption
 project ownership
-one-project constraint
+two-project limit
 agent run state
 cleanup logic
 ```
@@ -1978,7 +1955,7 @@ project create
 runtime create
 runtime destroy
 idle cleanup
-preview proxy
+published project preview
 cancel
 verification
 repair
@@ -2034,7 +2011,7 @@ Generated App 的业务测试由 Codex 随功能一起维护。
 - 数据目录。
 - PostgreSQL 网络方式。
 - Docker Socket 风险。
-- `*.localhost` 说明。
+- 项目预览端口段与云防火墙配置说明。
 - 完全清理数据方法。
 
 普通用户文档不解释内部 Coding Agent。
@@ -2103,7 +2080,7 @@ DECISIONS.md
 - Generated App = Next.js + TypeScript + Tailwind + shadcn/ui
 - Generated App ORM = Drizzle
 - Generated App Testing = Vitest + Testing Library
-- One user = one project in P0
+- One user = up to two projects in P0
 - One project = one Runtime Container
 - Runtime memory = 2 GiB
 - Runtime CPU = 2 cores
@@ -2122,7 +2099,7 @@ DECISIONS.md
 - Model service must support OpenAI Responses API
 - Product UI must not expose internal Codex implementation
 - Home is the default landing page after login
-- Projects page must exist even though P0 supports only one project
+- Projects page supports up to two projects in P0
 - Settings is the only place for model configuration
 - Project Workspace = Chat + Run Status + Preview + Inspect UI
 - Point & Edit does not implement source-code mapping in P0
@@ -2222,6 +2199,6 @@ Workspace / Codex State / Project DB / Messages preserved
 20. 用户侧不暴露内部 Coding Agent 实现。
 21. 模型服务只要求兼容 Responses API。
 22. Home 必须作为登录后的默认入口和核心聊天入口。
-23. Projects 页面必须保留，即使 P0 当前只能显示一个项目。
+23. Projects 页面必须保留，P0 当前最多显示两个项目。
 24. 模型配置只能放在独立 Settings 页面，不放在 Home Chat 或 Project Workspace。
 25. 最终从 clean volumes 完成一次全流程验证。

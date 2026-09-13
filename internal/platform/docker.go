@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type dockerClient struct{ client *http.Client }
@@ -69,6 +70,17 @@ func (d *dockerClient) inspect(ctx context.Context, name string) (dockerContaine
 	}
 	return dockerContainer{Exists: true, Running: raw.State.Running}, nil
 }
+func (d *dockerClient) ping(ctx context.Context) error {
+	res, err := d.request(ctx, http.MethodGet, "/_ping", nil)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return dockerError(res)
+	}
+	return nil
+}
 func (d *dockerClient) managedProjectIDs(ctx context.Context) ([]string, error) {
 	res, err := d.request(ctx, http.MethodGet, "/containers/json?all=true&filters="+url.QueryEscape(`{"label":["atoms.managed=true"]}`), nil)
 	if err != nil {
@@ -98,7 +110,7 @@ func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseUR
 		"Image": image, "WorkingDir": "/workspace",
 		// The preview server is the Runtime's primary process. This avoids a
 		// detached docker-exec race and lets Docker report a failed startup.
-		"Cmd":    []string{"sh", "-lc", "pnpm install --frozen-lockfile=false && pnpm dev --hostname 0.0.0.0 --port 3000"},
+		"Cmd":    []string{"sh", "-lc", "if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile --prefer-offline; else pnpm install --frozen-lockfile=false --prefer-offline; fi && pnpm dev --hostname 0.0.0.0 --port 3000"},
 		"Env":    []string{"DATABASE_URL=" + databaseURL, "NEXT_TELEMETRY_DISABLED=1"},
 		"Labels": map[string]string{"atoms.managed": "true", "atoms.project_id": p.ID},
 		"HostConfig": map[string]any{
@@ -123,11 +135,18 @@ func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseUR
 	}
 	res, err = d.request(ctx, http.MethodPost, "/containers/"+url.PathEscape(name)+"/start", nil)
 	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = d.remove(cleanupCtx, name)
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusNoContent && res.StatusCode != http.StatusNotModified {
-		return dockerError(res)
+		startErr := dockerError(res)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = d.remove(cleanupCtx, name)
+		return startErr
 	}
 	return nil
 }

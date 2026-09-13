@@ -56,7 +56,7 @@ func (s *authService) register(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusConflict, "EMAIL_ALREADY_REGISTERED")
 		return
 	}
-	s.setSession(w, u.ID)
+	s.setSession(w, r, u.ID)
 	writeJSON(w, http.StatusCreated, u)
 }
 
@@ -76,11 +76,11 @@ func (s *authService) login(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS")
 		return
 	}
-	s.setSession(w, u.ID)
+	s.setSession(w, r, u.ID)
 	writeJSON(w, http.StatusOK, u)
 }
-func (s *authService) logout(w http.ResponseWriter, _ *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Domain: "localhost", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
+func (s *authService) logout(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: secureRequest(r), MaxAge: -1})
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *authService) me(w http.ResponseWriter, r *http.Request) {
@@ -110,8 +110,8 @@ func (s *authService) requireUser(next http.Handler) http.Handler {
 func contextWithUser(r *http.Request, u User) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), currentUserKey{}, u))
 }
-func (s *authService) setSession(w http.ResponseWriter, userID string) {
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: s.signSession(userID), Domain: "localhost", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: false, MaxAge: int((7 * 24 * time.Hour).Seconds())})
+func (s *authService) setSession(w http.ResponseWriter, r *http.Request, userID string) {
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: s.signSession(userID), Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: secureRequest(r), MaxAge: int((7 * 24 * time.Hour).Seconds())})
 }
 func (s *authService) signSession(id string) string {
 	payload, _ := json.Marshal(struct {
@@ -177,16 +177,23 @@ func (s *authService) readPreview(v string) (string, string, bool) {
 	}
 	return payload.UserID, payload.ProjectID, true
 }
-func (s *authService) setPreviewCookie(w http.ResponseWriter, token string) {
+func (s *authService) setPreviewCookie(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     previewCookie,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   false,
+		Secure:   secureRequest(r),
 		MaxAge:   int((10 * time.Minute).Seconds()),
 	})
+}
+func secureRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0])
+	return strings.EqualFold(forwarded, "https")
 }
 func validEmail(v string) bool {
 	v = strings.TrimSpace(v)

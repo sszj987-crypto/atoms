@@ -7,7 +7,7 @@
 
 - Home is the default page after login.
 - Home is the primary natural-language build/change entry point.
-- Projects page must exist even though P0 supports only one project per user.
+- Projects page supports up to two projects per user in P0.
 - Settings is the only place for model configuration.
 - Project Workspace contains Chat, Run Status, Preview, and Inspect UI.
 - Product UI must not expose the internal Coding Agent implementation.
@@ -21,7 +21,8 @@
 - Frontend: React + Vite + TypeScript + Tailwind CSS.
 - Platform database: PostgreSQL.
 - Platform services: `atoms-app` + `postgres`.
-- Platform external port: `8080`.
+- Platform control-plane port: `8080`.
+- Every project Runtime publishes its stable assigned host port.
 - PostgreSQL is not exposed to the host by default.
 - Internal Docker network: `atoms-internal`.
 
@@ -40,10 +41,12 @@
 
 ## Project Model
 
-- P0: one user can own at most one project.
+- P0: one user can own at most two projects.
+- Each user receives a reserved host-port range; every project keeps one stable, unique port within that range.
 - The Projects page still uses plural project-oriented information architecture.
 - One project has at most one Runtime Container.
 - Project files are physically isolated by user and project.
+- The embedded Preview loads the same host/port endpoint as opening the project in a new browser tab; its displayed address is read-only.
 
 Data layout:
 

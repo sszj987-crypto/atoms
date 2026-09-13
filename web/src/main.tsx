@@ -8,6 +8,7 @@ type User = { id: string; email: string };
 type Config = { configured?: boolean; base_url?: string; api_key_set?: boolean; model?: string };
 type Project = { id: string; name: string; last_accessed_at: string };
 type RunProgress = { id: number; step_id?: string; kind: string; title: string; detail?: string; status?: string; created_at?: string };
+type Run = { id: string; status: string; error_message?: string };
 type Page = "home" | "projects" | "project" | "settings" | "auth";
 type Navigate = (page: Page, projectID?: string) => void;
 
@@ -36,10 +37,22 @@ function pathFor(page: Page, projectID?: string): string {
   return "/";
 }
 const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
-  const response = await fetch(`/api${path}`, { credentials: "include", headers: { "Content-Type": "application/json", ...(init?.headers || {}) }, ...init });
-  if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "REQUEST_FAILED"); }
-  if (response.status === 204) return undefined as T;
-  return response.json();
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 30_000);
+  const abort = () => controller.abort();
+  init?.signal?.addEventListener("abort", abort, { once: true });
+  try {
+    const response = await fetch(`/api${path}`, { ...init, signal: controller.signal, credentials: "include", headers: { "Content-Type": "application/json", ...(init?.headers || {}) } });
+    if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || "REQUEST_FAILED"); }
+    if (response.status === 204) return undefined as T;
+    return response.json();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw new Error("REQUEST_TIMEOUT");
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+    init?.signal?.removeEventListener("abort", abort);
+  }
 };
 
 const errorText = (e: unknown) => {
@@ -56,6 +69,9 @@ const errorText = (e: unknown) => {
     MODEL_CONFIG_REQUIRED: "请先在设置中配置模型服务",
     MODEL_TITLE_UNAVAILABLE: "模型暂时无法生成项目名称，请稍后重试",
     INVALID_PROJECT_NAME: "项目名称需为 1–16 个字符",
+    AGENT_RUN_IN_PROGRESS: "该项目已有任务正在运行",
+    INVALID_MESSAGE: "请输入 1–20000 个字符的需求",
+    REQUEST_TIMEOUT: "请求超时，请重试",
   };
   return zh[m] || m.replaceAll("_", " ");
 };
@@ -241,6 +257,12 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
   const [mobilePane, setMobilePane] = useState<"chat" | "preview">("chat");
   const load = () => api<{ messages: { id: string; role: string; content: string }[] }>(`/project/${project.id}/messages`).then(r => setMessages(r.messages));
   useEffect(() => {
+    setRun(null);
+    setProgress([]);
+    setChatError("");
+    setStatus("正在恢复项目环境…");
+  }, [project.id]);
+  useEffect(() => {
     if (!initialDraft) return;
     setText(initialDraft);
     onDraftConsumed();
@@ -260,15 +282,22 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
     return () => { active = false; };
   }, [project.id, reload]);
   useEffect(() => {
-    load();
+    load().catch(e => setChatError(errorText(e)));
+    api<{ run: Run | null }>(`/project/${project.id}/runs/active`).then(({ run: active }) => {
+      if (active) {
+        setRun(active.id);
+        setStatus(active.status);
+      }
+    }).catch(e => setChatError(errorText(e)));
     api<{ exists: boolean; running: boolean }>(`/project/${project.id}/runtime/status`).then(s => setStatus(s.running ? "运行时运行中" : "运行时启动中")).catch(() => setStatus("运行时不可用"));
-  }, [reload]);
+  }, [project.id, reload]);
   useEffect(() => {
     if (!run) return;
     const e = new EventSource(`/api/project/runs/${run}/events`);
     e.addEventListener("progress", v => {
-      const raw = JSON.parse((v as MessageEvent).data);
-      const next: RunProgress = { id: raw.id, step_id: raw.step_id, kind: raw.kind || "info", title: raw.title || raw.content, detail: raw.detail, status: raw.status, created_at: raw.created_at };
+      let raw: RunProgress & { content?: string };
+      try { raw = JSON.parse((v as MessageEvent).data); } catch { return; }
+      const next: RunProgress = { id: raw.id, step_id: raw.step_id, kind: raw.kind || "info", title: raw.title || raw.content || "收到进度更新", detail: raw.detail, status: raw.status, created_at: raw.created_at };
       setProgress(items => {
         const existing = items.findIndex(item => next.step_id ? item.step_id === next.step_id : item.id === next.id);
         if (existing >= 0) return items.map((item, index) => index === existing ? next : item);
@@ -276,18 +305,35 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
       });
     });
     e.addEventListener("status", v => {
-      const x = JSON.parse((v as MessageEvent).data);
+      let x: Run;
+      try { x = JSON.parse((v as MessageEvent).data); } catch { return; }
       setStatus(x.status);
-      if (["COMPLETED", "FAILED", "CANCELLED"].includes(x.status)) { e.close(); setRun(null); load(); setReload(n => n + 1); }
+      if (["COMPLETED", "FAILED", "CANCELLED"].includes(x.status)) {
+        e.close();
+        setRun(null);
+        if (x.error_message) setChatError(x.error_message);
+        load().catch(error => setChatError(errorText(error)));
+        setReload(n => n + 1);
+      }
     });
+    e.onerror = () => setStatus("正在重新连接工作记录…");
     return () => e.close();
-  }, [run]);
+  }, [run, project.id]);
   async function send() {
     if (!text.trim() || run) return;
     setChatError("");
     try {
       const r = await api<{ run_id: string }>(`/project/${project.id}/messages`, { method: "POST", body: JSON.stringify({ content: text, selected_ui: null }) });
-      setText(""); setProgress([]); load(); setRun(r.run_id);
+      setText(""); setProgress([]); load().catch(e => setChatError(errorText(e))); setRun(r.run_id);
+    } catch (e) { setChatError(errorText(e)); }
+  }
+  async function cancelRun() {
+    if (!run) return;
+    setChatError("");
+    try {
+      const result = await api<{ status: string; runtime_reset: boolean }>(`/project/runs/${run}/cancel`, { method: "POST" });
+      setStatus(result.status);
+      if (!result.runtime_reset) setChatError("任务已取消，但运行环境清理失败；请刷新预览后重试。");
     } catch (e) { setChatError(errorText(e)); }
   }
   const previewAddress = previewURL || "正在准备项目地址…";
@@ -304,7 +350,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
           <div className="panel-heading"><div><span className="panel-kicker">对话</span><h2>构建记录</h2></div>{messages.length > 0 && <span>{messages.length} 条消息</span>}</div>
           <div className="history">{messages.length ? messages.map(m => <div key={m.id} className={`message ${m.role}`}><span>{m.role === "user" ? "你" : "Atoms"}</span><p>{m.content}</p></div>) : <div className="chat-empty"><span aria-hidden="true">✦</span><h3>从描述需求开始</h3><p>告诉我你想构建或修改什么，执行过程会实时显示在这里。</p></div>}</div>
           {(run || progress.length > 0) && <div className="run-progress" aria-live="polite"><strong>工作记录</strong>{progress.length ? progress.map(item => <div className={`run-step ${item.kind} ${item.status || ""}`} key={item.step_id || item.id}><span className="run-step-icon" aria-hidden="true">{item.status === "completed" ? "✓" : item.status === "failed" ? "!" : item.status === "running" ? "" : "·"}</span><div><p>{item.title}</p>{item.detail && (item.kind === "command" ? <details><summary>查看命令</summary><code>{item.detail}</code></details> : <small>{item.detail}</small>)}</div></div>) : <div className="run-step running"><span className="run-step-icon" aria-hidden="true" /><div><p>正在排队…</p></div></div>}</div>}
-          {run && <div className="run-actions"><span>{statusText(status)}</span><button className="link" onClick={() => api(`/project/runs/${run}/cancel`, { method: "POST" })}>取消任务</button></div>}
+          {run && <div className="run-actions"><span>{statusText(status)}</span><button className="link" onClick={cancelRun}>取消任务</button></div>}
           {chatError && <p className="error" role="alert">{chatError}</p>}
           <div className="chat-composer"><textarea aria-label="描述项目修改" value={text} onChange={e => setText(e.target.value)} placeholder="描述你想要的修改…" /><div><span>{run ? "任务完成后可继续发送" : "描述越具体，结果越准确"}</span><button onClick={send} disabled={!!run || !text.trim()}>发送</button></div></div>
         </aside>

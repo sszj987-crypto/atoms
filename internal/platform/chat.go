@@ -3,17 +3,27 @@ package platform
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-type chatService struct{ projects *projectService }
+type chatService struct {
+	projects *projectService
+	mu       sync.Mutex
+	cancels  map[string]context.CancelFunc
+}
 
 type runProgressEvent struct {
 	StepID string `json:"step_id,omitempty"`
@@ -28,7 +38,9 @@ type codexFileChange struct {
 	Kind string `json:"kind"`
 }
 
-func newChatService(p *projectService) *chatService { return &chatService{projects: p} }
+func newChatService(p *projectService) *chatService {
+	return &chatService{projects: p, cancels: make(map[string]context.CancelFunc)}
+}
 func (s *chatService) messages(w http.ResponseWriter, r *http.Request) {
 	u := r.Context().Value(currentUserKey{}).(User)
 	p, e := s.projects.byID(r.Context(), u.ID, chi.URLParam(r, "id"))
@@ -62,24 +74,15 @@ func (s *chatService) send(w http.ResponseWriter, r *http.Request) {
 		Content    string `json:"content"`
 		SelectedUI any    `json:"selected_ui"`
 	}
-	if decodeJSON(r, &in) != nil || in.Content == "" {
+	if decodeJSON(r, &in) != nil || strings.TrimSpace(in.Content) == "" || len([]rune(in.Content)) > 20000 {
 		apiError(w, 400, "INVALID_MESSAGE")
 		return
 	}
+	in.Content = strings.TrimSpace(in.Content)
 	u := r.Context().Value(currentUserKey{}).(User)
 	p, e := s.projects.byID(r.Context(), u.ID, chi.URLParam(r, "id"))
 	if e != nil {
 		apiError(w, 404, "PROJECT_NOT_FOUND")
-		return
-	}
-	var active bool
-	e = s.projects.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, p.ID).Scan(&active)
-	if e != nil {
-		apiError(w, 500, "RUN_READ_FAILED")
-		return
-	}
-	if active {
-		apiError(w, 409, "AGENT_RUN_IN_PROGRESS")
 		return
 	}
 	mid, rid := newID(), newID()
@@ -89,42 +92,94 @@ func (s *chatService) send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if _, e = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtext($1))`, p.ID); e != nil {
+		apiError(w, 500, "RUN_CREATE_FAILED")
+		return
+	}
+	var active bool
+	if e = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, p.ID).Scan(&active); e != nil {
+		apiError(w, 500, "RUN_READ_FAILED")
+		return
+	}
+	if active {
+		apiError(w, 409, "AGENT_RUN_IN_PROGRESS")
+		return
+	}
 	_, e = tx.Exec(r.Context(), `INSERT INTO messages(id,project_id,role,content,selected_ui) VALUES($1,$2,'user',$3,$4)`, mid, p.ID, in.Content, in.SelectedUI)
 	if e == nil {
 		_, e = tx.Exec(r.Context(), `INSERT INTO agent_runs(id,project_id,status,user_message_id,started_at) VALUES($1,$2,'PENDING',$3,now())`, rid, p.ID, mid)
 	}
-	if e != nil || tx.Commit(r.Context()) != nil {
+	if e != nil {
+		if activeRunConflict(e) {
+			apiError(w, 409, "AGENT_RUN_IN_PROGRESS")
+			return
+		}
 		apiError(w, 500, "RUN_CREATE_FAILED")
 		return
 	}
-	go s.run(context.Background(), p, u.ID, rid, in.Content, in.SelectedUI)
+	if e = tx.Commit(r.Context()); e != nil {
+		if activeRunConflict(e) {
+			apiError(w, 409, "AGENT_RUN_IN_PROGRESS")
+			return
+		}
+		apiError(w, 500, "RUN_CREATE_FAILED")
+		return
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	s.mu.Lock()
+	s.cancels[rid] = cancel
+	s.mu.Unlock()
+	go func() {
+		defer s.unregisterRun(rid)
+		s.run(runCtx, p, u.ID, rid, in.Content, in.SelectedUI)
+	}()
 	writeJSON(w, 202, map[string]string{"run_id": rid})
+}
+func activeRunConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "agent_runs_one_active_per_project"
+}
+func (s *chatService) unregisterRun(runID string) {
+	s.mu.Lock()
+	delete(s.cancels, runID)
+	s.mu.Unlock()
+}
+func (s *chatService) cancelLocalRun(runID string) {
+	s.mu.Lock()
+	cancel := s.cancels[runID]
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt string, selected any) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
-	_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='RUNNING' WHERE id=$1`, runID)
+	tag, err := s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='RUNNING' WHERE id=$1 AND status='PENDING'`, runID)
+	if err != nil || tag.RowsAffected() == 0 {
+		return
+	}
 	s.progress(ctx, runID, "正在读取模型配置…")
 	var base, model string
 	var sealed []byte
-	err := s.projects.db.QueryRow(ctx, `SELECT base_url,api_key_ciphertext,model FROM llm_configs WHERE user_id=$1`, userID).Scan(&base, &sealed, &model)
+	err = s.projects.db.QueryRow(ctx, `SELECT base_url,api_key_ciphertext,model FROM llm_configs WHERE user_id=$1`, userID).Scan(&base, &sealed, &model)
 	if err != nil {
-		s.fail(ctx, runID, "Model configuration is required.")
+		s.fail(runID, "Model configuration is required.")
 		return
 	}
 	key, err := decrypt(s.projects.cfg.MasterKey, sealed)
 	if err != nil {
-		s.fail(ctx, runID, "Model configuration could not be read.")
+		s.fail(runID, "Model configuration could not be read.")
 		return
 	}
 	if err = s.projects.ensureRuntime(ctx, p); err != nil {
-		s.fail(ctx, runID, "Runtime could not be started.")
+		s.fail(runID, "Runtime could not be started.")
 		return
 	}
 	s.progress(ctx, runID, "正在准备隔离运行环境…")
 	config := fmt.Sprintf("model_provider = \"atoms\"\nmodel = %q\n[model_providers.atoms]\nname = \"Atoms\"\nbase_url = %q\nenv_key = \"OPENAI_API_KEY\"\nwire_api = \"responses\"\n", model, strings.TrimRight(base, "/"))
 	if err = os.WriteFile(filepath.Join(p.CodexStatePath, "config.toml"), []byte(config), 0600); err != nil {
-		s.fail(ctx, runID, "Session configuration failed.")
+		s.fail(runID, "Session configuration failed.")
 		return
 	}
 	if os.Geteuid() == 0 {
@@ -134,7 +189,7 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 	if selected != nil {
 		selectedJSON, marshalErr := json.Marshal(selected)
 		if marshalErr != nil {
-			s.fail(ctx, runID, "Selected UI context could not be encoded.")
+			s.fail(runID, "Selected UI context could not be encoded.")
 			return
 		}
 		task = "The user selected a rendered UI element. Locate its implementation and make the smallest reasonable change.\n\nSelected UI context:\n" + string(selectedJSON) + "\n\nUser request:\n" + prompt
@@ -160,23 +215,47 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 	redacted := []byte(strings.ReplaceAll(string(out), key, "[REDACTED]"))
 	_ = os.WriteFile(filepath.Join(filepath.Dir(p.WorkspacePath), "logs", runID+".ndjson"), redacted, 0600)
 	if err != nil {
-		s.fail(ctx, runID, "Application update failed.")
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			s.fail(runID, "Task timed out.")
+			return
+		}
+		s.fail(runID, "Application update failed.")
 		return
 	}
 	for repair := 0; repair <= 2; repair++ {
-		_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='VERIFYING' WHERE id=$1`, runID)
+		if !s.transitionRun(ctx, runID, "VERIFYING") {
+			if ctx.Err() == nil {
+				s.fail(runID, "Run state could not be saved.")
+			}
+			return
+		}
 		s.progress(ctx, runID, "正在验证类型、测试、构建和预览…")
 		if verifyErr := s.verify(ctx, p, runID); verifyErr == nil {
 			break
 		} else if repair == 2 {
-			s.fail(ctx, runID, "Verification failed after repair attempts.")
+			s.fail(runID, "Verification failed after repair attempts.")
 			return
 		} else {
-			_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='REPAIRING' WHERE id=$1`, runID)
+			if !s.transitionRun(ctx, runID, "REPAIRING") {
+				if ctx.Err() == nil {
+					s.fail(runID, "Run state could not be saved.")
+				}
+				return
+			}
 			s.progress(ctx, runID, "验证未通过，正在自动修复…")
-			fix := []string{"codex", "exec", "resume", "--last", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "Fix the verification failure: " + verifyErr.Error() + ". Then rerun the required checks."}
+			if err := s.projects.ensureRuntime(ctx, p); err != nil {
+				s.fail(runID, "Runtime could not be restarted for repair.")
+				return
+			}
+			fix := []string{"codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-C", "/workspace", "resume", "--last", "Fix the verification failure: " + verifyErr.Error() + ". Then rerun the required checks."}
 			if _, err := s.projects.docker.exec(ctx, runtimeName(p.ID), fix, []string{"CODEX_HOME=/codex", "OPENAI_API_KEY=" + key}); err != nil {
-				s.fail(ctx, runID, "Automatic repair failed.")
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return
+				}
+				s.fail(runID, "Automatic repair failed.")
 				return
 			}
 		}
@@ -185,9 +264,11 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 	if summary == "" {
 		summary = "应用更新完成。"
 	}
-	_, _ = s.projects.db.Exec(ctx, `INSERT INTO messages(id,project_id,role,content) SELECT $1,$2,'assistant',$3 WHERE EXISTS (SELECT 1 FROM agent_runs WHERE id=$4 AND status <> 'CANCELLED')`, newID(), p.ID, summary, runID)
-	_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='COMPLETED',finished_at=now() WHERE id=$1 AND status <> 'CANCELLED'`, runID)
-	s.progress(ctx, runID, "已完成。")
+	s.complete(runID, p.ID, summary)
+}
+func (s *chatService) transitionRun(ctx context.Context, runID, status string) bool {
+	tag, err := s.projects.db.Exec(ctx, `UPDATE agent_runs SET status=$2 WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')`, runID, status)
+	return err == nil && tag.RowsAffected() > 0
 }
 func (s *chatService) verify(ctx context.Context, p Project, runID string) error {
 	checks := []struct {
@@ -195,10 +276,10 @@ func (s *chatService) verify(ctx context.Context, p Project, runID string) error
 		title   string
 		command string
 	}{
+		{"install", "同步项目依赖", "pnpm install --frozen-lockfile=false --prefer-offline"},
 		{"typecheck", "TypeScript 类型检查", "pnpm typecheck"},
 		{"test", "自动化测试", "pnpm test"},
 		{"build", "生产版本构建", "pnpm build"},
-		{"smoke", "预览页面检查", "curl -fsS http://127.0.0.1:3000/ >/dev/null"},
 	}
 	for _, check := range checks {
 		event := runProgressEvent{StepID: "verify-" + check.id, Kind: "verify", Title: check.title, Detail: check.command, Status: "running"}
@@ -212,11 +293,74 @@ func (s *chatService) verify(ctx context.Context, p Project, runID string) error
 		event.Status = "completed"
 		s.progressEvent(ctx, runID, event)
 	}
+	restart := runProgressEvent{StepID: "verify-preview-restart", Kind: "verify", Title: "重启预览服务", Detail: "使用已验证的项目文件重建运行环境", Status: "running"}
+	s.progressEvent(ctx, runID, restart)
+	if err := s.projects.recreateRuntime(ctx, p); err != nil {
+		restart.Status = "failed"
+		restart.Detail = "运行环境重建失败"
+		s.progressEvent(ctx, runID, restart)
+		return fmt.Errorf("restart preview: %w", err)
+	}
+	if err := waitRuntimeReady(ctx, p.ID); err != nil {
+		restart.Status = "failed"
+		restart.Detail = "预览服务未能按时就绪"
+		s.progressEvent(ctx, runID, restart)
+		return fmt.Errorf("preview readiness: %w", err)
+	}
+	restart.Status = "completed"
+	s.progressEvent(ctx, runID, restart)
+
+	smoke := runProgressEvent{StepID: "verify-smoke", Kind: "verify", Title: "预览页面检查", Detail: "GET /", Status: "running"}
+	s.progressEvent(ctx, runID, smoke)
+	if _, err := s.projects.docker.exec(ctx, runtimeName(p.ID), []string{"sh", "-lc", "curl -fsS http://127.0.0.1:3000/ >/dev/null"}, nil); err != nil {
+		smoke.Status = "failed"
+		smoke.Detail = "预览首页请求失败"
+		s.progressEvent(ctx, runID, smoke)
+		return fmt.Errorf("preview smoke: %w", err)
+	}
+	smoke.Status = "completed"
+	s.progressEvent(ctx, runID, smoke)
 	return nil
 }
-func (s *chatService) fail(ctx context.Context, id, msg string) {
-	_, _ = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='FAILED',error_message=$2,finished_at=now() WHERE id=$1`, id, msg)
-	s.progress(ctx, id, msg)
+func (s *chatService) fail(id, msg string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tag, err := s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='FAILED',error_message=$2,finished_at=now() WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')`, id, msg)
+	if err == nil && tag.RowsAffected() > 0 {
+		s.progress(ctx, id, msg)
+	}
+}
+func (s *chatService) complete(runID, projectID, summary string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	saved, err := func() (bool, error) {
+		tx, err := s.projects.db.Begin(ctx)
+		if err != nil {
+			return false, err
+		}
+		defer tx.Rollback(ctx)
+		tag, err := tx.Exec(ctx, `UPDATE agent_runs SET status='COMPLETED',finished_at=now() WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')`, runID)
+		if err != nil {
+			return false, err
+		}
+		if tag.RowsAffected() == 0 {
+			return false, nil
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO messages(id,project_id,role,content) VALUES($1,$2,'assistant',$3)`, newID(), projectID, summary); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}()
+	if err != nil {
+		s.fail(runID, "Run result could not be saved.")
+		return
+	}
+	if saved {
+		s.progress(ctx, runID, "已完成。")
+	}
 }
 func (s *chatService) progress(ctx context.Context, runID, message string) {
 	s.progressEvent(ctx, runID, runProgressEvent{Kind: "info", Title: publicProgressText(message)})
@@ -435,6 +579,28 @@ func (s *chatService) runInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, run)
 }
+func (s *chatService) activeRun(w http.ResponseWriter, r *http.Request) {
+	u := r.Context().Value(currentUserKey{}).(User)
+	var v runView
+	err := s.projects.db.QueryRow(r.Context(), `
+		SELECT r.id,r.project_id,r.status,r.error_message,r.started_at,r.finished_at
+		FROM agent_runs r
+		JOIN projects p ON p.id=r.project_id
+		WHERE r.project_id=$1 AND p.user_id=$2
+		  AND r.status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')
+		ORDER BY r.started_at DESC
+		LIMIT 1
+	`, chi.URLParam(r, "id"), u.ID).Scan(&v.ID, &v.ProjectID, &v.Status, &v.ErrorMessage, &v.StartedAt, &v.FinishedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(w, http.StatusOK, map[string]any{"run": nil})
+		return
+	}
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, "RUN_READ_FAILED")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"run": v})
+}
 func (s *chatService) events(w http.ResponseWriter, r *http.Request) {
 	_, ok := s.ownedRun(w, r)
 	if !ok {
@@ -450,6 +616,11 @@ func (s *chatService) events(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var lastEventID int64
+	if raw := strings.TrimSpace(r.Header.Get("Last-Event-ID")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			lastEventID = parsed
+		}
+	}
 	for {
 		run, exists := s.ownedRun(w, r)
 		if !exists {
@@ -474,7 +645,7 @@ func (s *chatService) events(w http.ResponseWriter, r *http.Request) {
 						payload["content"] = event.Title
 					}
 					raw, _ := json.Marshal(payload)
-					fmt.Fprintf(w, "event: progress\ndata: %s\n\n", raw)
+					fmt.Fprintf(w, "id: %d\nevent: progress\ndata: %s\n\n", id, raw)
 				}
 			}
 			rows.Close()
@@ -501,20 +672,29 @@ func (s *chatService) cancel(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 409, "RUN_NOT_ACTIVE")
 		return
 	}
-	_, e := s.projects.db.Exec(r.Context(), `UPDATE agent_runs SET status='CANCELLED',finished_at=now() WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')`, run.ID)
+	tag, e := s.projects.db.Exec(r.Context(), `UPDATE agent_runs SET status='CANCELLED',finished_at=now() WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')`, run.ID)
 	if e != nil {
 		apiError(w, 500, "RUN_CANCEL_FAILED")
 		return
 	}
-	var projectID string
-	if err := s.projects.db.QueryRow(r.Context(), `SELECT project_id FROM agent_runs WHERE id=$1`, run.ID).Scan(&projectID); err == nil {
-		go s.projects.docker.exec(context.Background(), runtimeName(projectID), []string{"sh", "-lc", "pkill -f 'codex exec' || true"}, nil)
+	if tag.RowsAffected() == 0 {
+		apiError(w, http.StatusConflict, "RUN_NOT_ACTIVE")
+		return
 	}
-	writeJSON(w, 200, map[string]string{"status": "CANCELLED"})
+	s.cancelLocalRun(run.ID)
+	resetCtx, resetCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer resetCancel()
+	runtimeReset := true
+	if err := s.projects.removeRuntime(resetCtx, run.ProjectID); err != nil {
+		runtimeReset = false
+		log.Printf("cancel runtime cleanup failed run_id=%s project_id=%s: %v", run.ID, run.ProjectID, err)
+	}
+	writeJSON(w, 200, map[string]any{"status": "CANCELLED", "runtime_reset": runtimeReset})
 }
 
 type runView struct {
 	ID           string  `json:"id"`
+	ProjectID    string  `json:"-"`
 	Status       string  `json:"status"`
 	ErrorMessage *string `json:"error_message,omitempty"`
 	StartedAt    any     `json:"started_at"`
@@ -524,12 +704,54 @@ type runView struct {
 func (s *chatService) ownedRun(w http.ResponseWriter, r *http.Request) (runView, bool) {
 	u := r.Context().Value(currentUserKey{}).(User)
 	var v runView
-	e := s.projects.db.QueryRow(r.Context(), `SELECT r.id,r.status,r.error_message,r.started_at,r.finished_at FROM agent_runs r JOIN projects p ON p.id=r.project_id WHERE r.id=$1 AND p.user_id=$2`, chi.URLParam(r, "id"), u.ID).Scan(&v.ID, &v.Status, &v.ErrorMessage, &v.StartedAt, &v.FinishedAt)
+	e := s.projects.db.QueryRow(r.Context(), `SELECT r.id,r.project_id,r.status,r.error_message,r.started_at,r.finished_at FROM agent_runs r JOIN projects p ON p.id=r.project_id WHERE r.id=$1 AND p.user_id=$2`, chi.URLParam(r, "id"), u.ID).Scan(&v.ID, &v.ProjectID, &v.Status, &v.ErrorMessage, &v.StartedAt, &v.FinishedAt)
 	if e != nil {
 		apiError(w, 404, "RUN_NOT_FOUND")
 		return runView{}, false
 	}
 	return v, true
+}
+func (s *chatService) recoverInterruptedRuns(ctx context.Context) error {
+	rows, err := s.projects.db.Query(ctx, `
+		UPDATE agent_runs
+		SET status='FAILED', error_message='服务重启导致任务中断，请重新提交。', finished_at=now()
+		WHERE status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')
+		RETURNING project_id
+	`)
+	if err != nil {
+		return err
+	}
+	projects := map[string]struct{}{}
+	for rows.Next() {
+		var projectID string
+		if err := rows.Scan(&projectID); err != nil {
+			rows.Close()
+			return err
+		}
+		projects[projectID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for projectID := range projects {
+		cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := s.projects.removeRuntime(cleanupCtx, projectID)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("remove interrupted runtime %s: %w", projectID, err)
+		}
+	}
+	return nil
+}
+func (s *chatService) shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	for _, cancel := range s.cancels {
+		cancel()
+	}
+	s.mu.Unlock()
+	return s.recoverInterruptedRuns(ctx)
 }
 func terminal(s string) bool { return s == "COMPLETED" || s == "FAILED" || s == "CANCELLED" }
 func extractSummary(raw []byte) string {

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -31,6 +32,10 @@ type App struct {
 	model    *modelService
 	projects *projectService
 	chat     *chatService
+	cancel   context.CancelFunc
+	shutdown sync.Once
+	stopErr  error
+	close    sync.Once
 }
 
 func NewApp(ctx context.Context, cfg Config) (*App, error) {
@@ -69,12 +74,38 @@ func NewApp(ctx context.Context, cfg Config) (*App, error) {
 	}
 	model := newModelService(db, cfg.MasterKey)
 	projects := newProjectService(db, cfg, model)
-	projects.recover(ctx)
-	projects.startCleanup(context.Background())
-	return &App{cfg: cfg, db: db, auth: newAuthService(db, cfg.SessionKey, cfg.DeployPortBase, cfg.DeployPortSpan), model: model, projects: projects, chat: newChatService(projects)}, nil
+	chat := newChatService(projects)
+	if err := projects.recover(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("recover project runtimes: %w", err)
+	}
+	if err := chat.recoverInterruptedRuns(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("recover interrupted runs: %w", err)
+	}
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
+	projects.startCleanup(lifecycleCtx)
+	return &App{cfg: cfg, db: db, auth: newAuthService(db, cfg.SessionKey, cfg.DeployPortBase, cfg.DeployPortSpan), model: model, projects: projects, chat: chat, cancel: lifecycleCancel}, nil
 }
 
-func (a *App) Close() { a.db.Close() }
+func (a *App) Close() {
+	a.close.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := a.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "atoms shutdown cleanup: %v\n", err)
+		}
+		a.db.Close()
+	})
+}
+
+func (a *App) Shutdown(ctx context.Context) error {
+	a.shutdown.Do(func() {
+		a.cancel()
+		a.stopErr = a.chat.shutdown(ctx)
+	})
+	return a.stopErr
+}
 
 func (a *App) Router() http.Handler {
 	r := chi.NewRouter()
@@ -92,7 +123,7 @@ func (a *App) Router() http.Handler {
 				var u User
 				if err := a.db.QueryRow(r.Context(), `SELECT id,email FROM users WHERE id=$1`, userID).Scan(&u.ID, &u.Email); err == nil {
 					if fromQuery {
-						a.auth.setPreviewCookie(w, token)
+						a.auth.setPreviewCookie(w, r, token)
 					}
 					a.preview(w, contextWithUser(r, u))
 					return
@@ -108,8 +139,24 @@ func (a *App) Router() http.Handler {
 
 func (a *App) platformHandler() http.Handler {
 	r := chi.NewRouter()
-	r.Get("/api/health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		components := map[string]string{"postgres": "ok", "docker": "ok"}
+		status := http.StatusOK
+		if err := a.db.Ping(ctx); err != nil {
+			components["postgres"] = "unavailable"
+			status = http.StatusServiceUnavailable
+		}
+		if err := a.projects.docker.ping(ctx); err != nil {
+			components["docker"] = "unavailable"
+			status = http.StatusServiceUnavailable
+		}
+		overall := "ok"
+		if status != http.StatusOK {
+			overall = "unavailable"
+		}
+		writeJSON(w, status, map[string]any{"status": overall, "components": components})
 	})
 	r.Route("/api", func(r chi.Router) {
 		r.Post("/auth/register", a.auth.register)
@@ -131,6 +178,7 @@ func (a *App) platformHandler() http.Handler {
 			r.Post("/project/{id}/deploy", a.projects.deploy)
 			r.Get("/project/{id}/messages", a.chat.messages)
 			r.Post("/project/{id}/messages", a.chat.send)
+			r.Get("/project/{id}/runs/active", a.chat.activeRun)
 			r.Get("/project/runs/{id}", a.chat.runInfo)
 			r.Post("/project/runs/{id}/cancel", a.chat.cancel)
 		})
@@ -235,17 +283,45 @@ func staticHandler(dir string) (http.Handler, error) {
 }
 
 func migrate(ctx context.Context, db *pgxpool.Pool) error {
+	if _, err := db.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		name text PRIMARY KEY,
+		applied_at timestamptz NOT NULL DEFAULT now()
+	)`); err != nil {
+		return fmt.Errorf("create migration ledger: %w", err)
+	}
 	entries, err := fs.Glob(migrationFiles, "migrations/*.sql")
 	if err != nil {
 		return err
 	}
 	for _, name := range entries {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin migration %s: %w", name, err)
+		}
+		var applied bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name=$1)`, name).Scan(&applied); err != nil {
+			tx.Rollback(ctx)
+			return fmt.Errorf("read migration %s: %w", name, err)
+		}
+		if applied {
+			tx.Rollback(ctx)
+			continue
+		}
 		raw, err := migrationFiles.ReadFile(name)
 		if err != nil {
+			tx.Rollback(ctx)
 			return err
 		}
-		if _, err := db.Exec(ctx, string(raw)); err != nil {
+		if _, err := tx.Exec(ctx, string(raw)); err != nil {
+			tx.Rollback(ctx)
 			return fmt.Errorf("migration %s: %w", name, err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(name) VALUES($1)`, name); err != nil {
+			tx.Rollback(ctx)
+			return fmt.Errorf("record migration %s: %w", name, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit migration %s: %w", name, err)
 		}
 	}
 	return nil
