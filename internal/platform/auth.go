@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -91,11 +92,13 @@ func (s *authService) requireUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie(sessionCookie)
 		if err != nil {
+			log.Printf("requireUser no cookie path=%s err=%v", r.URL.Path, err)
 			apiError(w, http.StatusUnauthorized, "AUTH_REQUIRED")
 			return
 		}
 		userID, ok := s.readSession(cookie.Value)
 		if !ok {
+			log.Printf("requireUser invalid session path=%s", r.URL.Path)
 			apiError(w, http.StatusUnauthorized, "AUTH_REQUIRED")
 			return
 		}
