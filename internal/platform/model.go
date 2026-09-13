@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -144,6 +145,7 @@ func (s *modelService) projectTitle(ctx context.Context, userID, description str
 		if title := projectTitleFromResponse(raw); title != "" {
 			return title, nil
 		}
+		log.Printf("projectTitle invalid title retry=%v model=%s raw=%s", attempt > 0, in.Model, strings.TrimSpace(string(raw)))
 	}
 	return "", errModelTitleUnavailable
 }
@@ -159,7 +161,7 @@ func (s *modelService) requestProjectTitle(ctx context.Context, in modelInput, d
 		"model":             in.Model,
 		"instructions":      instructions,
 		"input":             prompt,
-		"max_output_tokens": 32,
+		"max_output_tokens": 256,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(in.BaseURL, "/")+"/responses", bytes.NewReader(body))
 	if err != nil {
@@ -169,10 +171,13 @@ func (s *modelService) requestProjectTitle(ctx context.Context, in modelInput, d
 	req.Header.Set("Content-Type", "application/json")
 	res, err := s.client.Do(req)
 	if err != nil {
+		log.Printf("projectTitle request error retry=%v model=%s err=%v", retry, in.Model, err)
 		return nil, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(res.Body, 8<<10))
+		log.Printf("projectTitle non-2xx retry=%v model=%s status=%d body=%s", retry, in.Model, res.StatusCode, strings.TrimSpace(string(raw)))
 		return nil, errModelTitleUnavailable
 	}
 	return io.ReadAll(io.LimitReader(res.Body, 64<<10))
