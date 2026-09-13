@@ -72,6 +72,7 @@ const errorText = (e: unknown) => {
     AGENT_RUN_IN_PROGRESS: "该项目已有任务正在运行",
     INVALID_MESSAGE: "请输入 1–20000 个字符的需求",
     REQUEST_TIMEOUT: "请求超时，请重试",
+    TOO_MANY_ATTEMPTS: "尝试次数过多，请稍后再试",
   };
   return zh[m] || m.replaceAll("_", " ");
 };

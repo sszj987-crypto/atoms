@@ -47,7 +47,18 @@ type modelResponse struct {
 
 func validateModelInput(in modelInput) bool {
 	u, err := url.ParseRequestURI(in.BaseURL)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" && strings.TrimSpace(in.APIKey) != "" && strings.TrimSpace(in.Model) != ""
+	if err != nil || u.Host == "" || strings.TrimSpace(in.APIKey) == "" || strings.TrimSpace(in.Model) == "" {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	// Plain http is only acceptable for a local loopback gateway.
+	return u.Scheme == "http" && isLoopbackHost(u.Hostname())
+}
+
+func isLoopbackHost(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 func (s *modelService) get(w http.ResponseWriter, r *http.Request) {
@@ -145,7 +156,7 @@ func (s *modelService) projectTitle(ctx context.Context, userID, description str
 		if title := projectTitleFromResponse(raw); title != "" {
 			return title, nil
 		}
-		log.Printf("projectTitle invalid title retry=%v model=%s raw=%s", attempt > 0, in.Model, strings.TrimSpace(string(raw)))
+		log.Printf("projectTitle invalid title retry=%v model=%s raw=%s", attempt > 0, in.Model, strings.TrimSpace(strings.ReplaceAll(string(raw), in.APIKey, "[REDACTED]")))
 	}
 	return "", errModelTitleUnavailable
 }
@@ -177,7 +188,7 @@ func (s *modelService) requestProjectTitle(ctx context.Context, in modelInput, d
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(res.Body, 8<<10))
-		log.Printf("projectTitle non-2xx retry=%v model=%s status=%d body=%s", retry, in.Model, res.StatusCode, strings.TrimSpace(string(raw)))
+		log.Printf("projectTitle non-2xx retry=%v model=%s status=%d body=%s", retry, in.Model, res.StatusCode, strings.TrimSpace(strings.ReplaceAll(string(raw), in.APIKey, "[REDACTED]")))
 		return nil, errModelTitleUnavailable
 	}
 	return io.ReadAll(io.LimitReader(res.Body, 64<<10))
@@ -188,6 +199,7 @@ func projectTitleFromResponse(raw []byte) string {
 		OutputText json.RawMessage `json:"output_text"`
 		Output     []struct {
 			Content []struct {
+				Type string          `json:"type"`
 				Text json.RawMessage `json:"text"`
 			} `json:"content"`
 		} `json:"output"`
@@ -204,6 +216,9 @@ func projectTitleFromResponse(raw []byte) string {
 	if title == "" {
 		for _, output := range response.Output {
 			for _, content := range output.Content {
+				if content.Type == "reasoning_text" {
+					continue
+				}
 				if text := responseText(content.Text); text != "" {
 					title = text
 					break

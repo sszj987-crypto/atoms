@@ -107,9 +107,18 @@ func (a *App) Shutdown(ctx context.Context) error {
 	return a.stopErr
 }
 
+func hsts(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secureRequest(r) {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (a *App) Router() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.RealIP, middleware.Logger, middleware.Recoverer)
+	r.Use(middleware.RequestID, middleware.RealIP, hsts, middleware.Logger, middleware.Recoverer)
 	r.Handle("/*", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if projectID := previewProjectID(r.Host); projectID != "" {
 			token := r.URL.Query().Get("preview_token")
@@ -159,8 +168,8 @@ func (a *App) platformHandler() http.Handler {
 		writeJSON(w, status, map[string]any{"status": overall, "components": components})
 	})
 	r.Route("/api", func(r chi.Router) {
-		r.Post("/auth/register", a.auth.register)
-		r.Post("/auth/login", a.auth.login)
+		r.With(authRateLimit).Post("/auth/register", a.auth.register)
+		r.With(authRateLimit).Post("/auth/login", a.auth.login)
 		r.Post("/auth/logout", a.auth.logout)
 		r.Group(func(r chi.Router) {
 			r.Use(a.auth.requireUser, middleware.Timeout(30*time.Second))

@@ -80,7 +80,7 @@ func (s *authService) login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, u)
 }
 func (s *authService) logout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: secureRequest(r), MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: secureRequest(r), MaxAge: -1})
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *authService) me(w http.ResponseWriter, r *http.Request) {
@@ -111,7 +111,7 @@ func contextWithUser(r *http.Request, u User) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), currentUserKey{}, u))
 }
 func (s *authService) setSession(w http.ResponseWriter, r *http.Request, userID string) {
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: s.signSession(userID), Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: secureRequest(r), MaxAge: int((7 * 24 * time.Hour).Seconds())})
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: s.signSession(userID), Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: secureRequest(r), MaxAge: int((7 * 24 * time.Hour).Seconds())})
 }
 func (s *authService) signSession(id string) string {
 	payload, _ := json.Marshal(struct {

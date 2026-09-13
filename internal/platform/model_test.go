@@ -69,6 +69,7 @@ func TestProjectTitleFromResponse(t *testing.T) {
 	}{
 		{"normalizes label", `{"output_text":"项目名称：智能待办"}`, "智能待办"},
 		{"rejects explanation", `{"output_text":"用户想要一个简洁、具体的中文项目名称，用于一个 Web 应用（计"}`, ""},
+		{"skips reasoning, extracts output_text", `{"output":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"The user wants a name."}]},{"type":"message","content":[{"type":"output_text","text":"随手算"}]}]}`, "随手算"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := projectTitleFromResponse([]byte(tc.raw)); got != tc.want {
@@ -91,6 +92,27 @@ func TestValidProjectName(t *testing.T) {
 	} {
 		if got := validProjectName(tc.name); got != tc.want {
 			t.Fatalf("validProjectName(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestValidateModelInput(t *testing.T) {
+	valid := func(base, key, model string) bool { return validateModelInput(modelInput{BaseURL: base, APIKey: key, Model: model}) }
+	cases := []struct {
+		name string
+		got  bool
+		want bool
+	}{
+		{"https remote", valid("https://api.example.com/v1", "sk-x", "m"), true},
+		{"http remote rejected", valid("http://api.example.com/v1", "sk-x", "m"), false},
+		{"http localhost allowed", valid("http://localhost:3000/v1", "sk-x", "m"), true},
+		{"http 127.0.0.1 allowed", valid("http://127.0.0.1:3000/v1", "sk-x", "m"), true},
+		{"missing key", valid("https://api.example.com/v1", "", "m"), false},
+		{"missing model", valid("https://api.example.com/v1", "sk-x", ""), false},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Fatalf("%s: validateModelInput = %v, want %v", tc.name, tc.got, tc.want)
 		}
 	}
 }
