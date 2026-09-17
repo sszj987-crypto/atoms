@@ -1,0 +1,5 @@
+@import "tailwindcss";
+body { margin: 0; font-family: Arial, sans-serif; background: #f8fafc; color: #172036; }
+main { max-width: 720px; margin: 0 auto; padding: 7rem 2rem; }
+h1 { font-size: clamp(2.5rem, 6vw, 5rem); letter-spacing: -.06em; margin: .25rem 0 1rem; }
+.eyebrow { color: #5b5ce2; font-weight: 800; font-size: .75rem; letter-spacing: .14em; }

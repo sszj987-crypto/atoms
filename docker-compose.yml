@@ -1,0 +1,71 @@
+services:
+  atoms-app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      APP_PORT: "8080"
+      # Keyword/value DSN intentionally avoids URL-escaping user-provided passwords.
+      DATABASE_URL: host=postgres port=5432 user=atoms password=${POSTGRES_PASSWORD} dbname=atoms sslmode=disable
+      APP_MASTER_KEY: ${APP_MASTER_KEY}
+      APP_SESSION_KEY: ${APP_SESSION_KEY}
+      WEB_DIR: /app/web/dist
+      DATA_VOLUME_NAME: atoms-data
+      RUNTIME_NETWORK: atoms-internal
+      DEPLOY_PORT_BASE: ${DEPLOY_PORT_BASE:-18000}
+      DEPLOY_PORT_SPAN: ${DEPLOY_PORT_SPAN:-5}
+    volumes:
+      - atoms-data:/data
+      # Phase 2 will use this connection to manage disposable project runtimes.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - atoms-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      runtime-image:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/api/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: atoms
+      POSTGRES_USER: atoms
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atoms -d atoms"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - atoms-internal
+
+  # Build-only init service. It exits immediately after making atoms-runtime:latest available.
+  runtime-image:
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+    image: atoms-runtime:latest
+    command: ["true"]
+    restart: "no"
+    networks:
+      - atoms-internal
+
+volumes:
+  atoms-data:
+    name: atoms-data
+  postgres-data:
+
+networks:
+  atoms-internal:
+    name: atoms-internal

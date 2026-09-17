@@ -1,0 +1,41 @@
+{
+  "name": "atoms-generated-app",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.15.1",
+  "scripts": {
+    "dev": "ATOMS_DEV=1 next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "1.2.3",
+    "@tailwindcss/postcss": "4.1.12",
+    "drizzle-orm": "0.45.2",
+    "next": "15.5.25",
+    "pg": "8.16.3",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "6.8.0",
+    "@testing-library/react": "16.3.0",
+    "@types/node": "24.3.0",
+    "@types/react": "19.1.10",
+    "@types/react-dom": "19.1.7",
+    "@types/pg": "8.15.5",
+    "drizzle-kit": "0.31.4",
+    "jsdom": "26.1.0",
+    "tailwindcss": "4.1.12",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
+  },
+  "pnpm": {
+    "overrides": {
+      "postcss": "8.5.23",
+      "sharp": "0.35.4"
+    }
+  }
+}
