@@ -1,0 +1,16 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>文件树交互测试</title><div id="root"></div><script type="module">
+import React from 'react';
+import {createRoot} from 'react-dom/client';
+import {SourceFilesPanel} from './src/SourceFilesPanel.tsx';
+import './src/styles.css';
+const files = [
+  {path:'app',is_dir:true,size:0},
+  {path:'app/pages',is_dir:true,size:0},
+  {path:'app/pages/Home.tsx',is_dir:false,size:32},
+  {path:'public',is_dir:true,size:0},
+  {path:'public/中文 图片.png',is_dir:false,size:3},
+  {path:'pnpm-lock.yaml',is_dir:false,size:10},
+];
+const request = async path => path.endsWith('/files') ? {files,run_active:false} : {path:decodeURIComponent(path.split('path=')[1]),is_dir:false,size:32,previewable:true,content:'export default function Home() {}'};
+createRoot(document.getElementById('root')).render(React.createElement('main',{style:{height:'100dvh',display:'flex',flexDirection:'column',padding:'12px'}},React.createElement(SourceFilesPanel,{projectID:'fixture',visible:true,runActive:false,refreshKey:0,request,formatError:String})));
+</script></html>

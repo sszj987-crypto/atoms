@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { RunProgressPanel } from "./RunProgressPanel";
+import { SourceFilesPanel } from "./SourceFilesPanel";
 import "./styles.css";
 import "./phase2.css";
 import "./phase3.css";
@@ -74,6 +75,14 @@ const errorText = (e: unknown) => {
     INVALID_MESSAGE: "请输入 1–20000 个字符的需求",
     REQUEST_TIMEOUT: "请求超时，请重试",
     TOO_MANY_ATTEMPTS: "尝试次数过多，请稍后再试",
+    PROJECT_NOT_FOUND: "项目不存在或无权访问",
+    PROJECT_READ_FAILED: "读取项目失败，请重试",
+    INVALID_FILE_PATH: "文件路径无效或不允许访问",
+    FILE_NOT_FOUND: "文件不存在，可能已被开发任务删除，请刷新文件",
+    FILE_READ_FAILED: "读取文件失败，请重试",
+    SOURCE_EXPORT_FAILED: "源码下载或导出失败，请重试",
+    SOURCE_LIMIT_EXCEEDED: "超过文件区限制：文件列表最多 20,000 项，导出最多 10,000 个文件 / 100 MiB，单文件下载最多 100 MiB",
+    RUN_READ_FAILED: "无法确认任务状态，请重试",
   };
   return zh[m] || m.replaceAll("_", " ");
 };
@@ -266,6 +275,8 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
   const [previewError, setPreviewError] = useState("");
   const [chatError, setChatError] = useState("");
   const [sending, setSending] = useState(false);
+  const [runKnown, setRunKnown] = useState(false);
+  const [outputPane, setOutputPane] = useState<"preview" | "files">("preview");
   const [mobilePane, setMobilePane] = useState<"chat" | "preview">("chat");
   const load = () => api<{ messages: { id: string; role: string; content: string }[] }>(`/project/${project.id}/messages`).then(r => setMessages(r.messages));
   useEffect(() => {
@@ -274,7 +285,22 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
     setShowProgress(false);
     setChatError("");
     setStatus("正在恢复项目环境…");
+    setRunKnown(false);
+    setOutputPane("preview");
   }, [project.id]);
+  useEffect(() => {
+    if (run) return;
+    const controller = new AbortController();
+    // Recover an initial status failure and notice work started in another tab.
+    const timer = window.setInterval(() => {
+      api<{ run: Run | null }>(`/project/${project.id}/runs/active`, { signal: controller.signal }).then(({ run: active }) => {
+        if (controller.signal.aborted) return;
+        setRunKnown(true);
+        if (active) { setRun(active.id); setShowProgress(true); setStatus(active.status); }
+      }).catch(() => { if (!controller.signal.aborted) setRunKnown(false); });
+    }, 5000);
+    return () => { window.clearInterval(timer); controller.abort(); };
+  }, [project.id, run]);
   useEffect(() => {
     if (!initialDraft) return;
     setText(initialDraft);
@@ -299,6 +325,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
     load().catch(e => setChatError(errorText(e)));
     api<{ run: Run | null }>(`/project/${project.id}/runs/active`).then(({ run: active }) => {
       if (!current) return;
+      setRunKnown(true);
       if (active) {
         setRun(active.id);
         setShowProgress(true);
@@ -404,6 +431,17 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
           }} placeholder="描述你想要的修改…" /><div><span>{run ? "任务完成后可继续发送" : "描述越具体，结果越准确"}</span><button onClick={send} disabled={sending || !!run || !text.trim()}>发送</button></div></div>
         </aside>
         <div className={`preview ${mobilePane !== "preview" ? "mobile-hidden" : ""}`}>
+          <div className="workspace-output-tabs" role="tablist" aria-label="项目内容" onKeyDown={event => {
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const next = event.key === "Home" ? "preview" : event.key === "End" ? "files" : outputPane === "preview" ? "files" : "preview";
+            setOutputPane(next);
+            document.getElementById(`workspace-${next}-tab`)?.focus();
+          }}>
+            <button id="workspace-preview-tab" role="tab" tabIndex={outputPane === "preview" ? 0 : -1} aria-selected={outputPane === "preview"} aria-controls="workspace-preview" className={outputPane === "preview" ? "active" : ""} onClick={() => setOutputPane("preview")}>预览</button>
+            <button id="workspace-files-tab" role="tab" tabIndex={outputPane === "files" ? 0 : -1} aria-selected={outputPane === "files"} aria-controls="workspace-files" className={outputPane === "files" ? "active" : ""} onClick={() => setOutputPane("files")}>文件</button>
+          </div>
+          <div className="preview-content" hidden={outputPane !== "preview"} role="tabpanel" id="workspace-preview" aria-labelledby="workspace-preview-tab">
           <div className="preview-bar">
             <div className="browser-dots" aria-hidden="true"><i /><i /><i /></div>
             <div className="preview-addressbar"><span aria-hidden="true">⌕</span><input aria-label="项目预览地址" readOnly value={previewAddress} /></div>
@@ -412,6 +450,8 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
             </div>
           </div>
           {previewURL ? <iframe key={reload} title="项目预览" src={previewURL} /> : previewError ? <div className="preview-loading" role="alert"><p>{previewError}</p><button onClick={refreshPreview}>重新启动</button></div> : <div className="preview-loading" role="status"><span className="spinner" aria-hidden="true" /><p>正在启动项目预览…</p></div>}
+          </div>
+          <SourceFilesPanel key={project.id} projectID={project.id} visible={outputPane === "files"} runActive={runKnown ? !!run || sending : null} refreshKey={reload} request={api} formatError={errorText} />
         </div>
       </div>
     </section>

@@ -10,6 +10,10 @@
 - Projects page supports up to two projects per user in P0.
 - Settings is the only place for model configuration.
 - Project Workspace contains Chat, Run Status, Preview, and Inspect UI.
+- Preview and a read-only Files panel share the workspace's right pane; Preview is the default tab. Switching tabs must retain the preview iframe and file selection.
+- Files supports source viewing, single-file downloads, and source ZIP export from the same workspace used by Preview, even without a Runtime.
+- Downloads and export require an idle project and snapshot files under the same project advisory lock as run creation and deletion. Dependencies, build artifacts, caches, logs, session state, secrets, and symbolic links are excluded.
+- Files does not support editing, version history, version switching, or rollback in this release.
 - Product UI must not expose the internal Coding Agent implementation.
 - Point & Edit is a P0 feature.
 - Point & Edit does not implement DOM-to-source-code mapping in P0.

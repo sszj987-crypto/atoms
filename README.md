@@ -35,6 +35,20 @@ For a Tencent Cloud host, keep PostgreSQL private and allow inbound TCP `8080` p
 
 The Compose configuration mounts the Docker socket into `atoms-app`. This is a deliberate local-demo trade-off for Phase 2 runtime management and grants the container elevated host Docker authority. It is not a production deployment model.
 
+## Source files and export
+
+In Project Workspace, the right pane defaults to **预览** (Preview). Choose **文件** (Files) to browse the collapsible file tree and read source with line numbers. You can hide/show the entire tree and search file names or relative paths (case-insensitive, not file contents). Search reveals matching paths automatically; clearing it restores previous directory folds. Switching tabs preserves the preview iframe, file selection, tree visibility, and search. Files are read directly from the same persistent workspace mounted by Preview; viewing does not require a running project container. During development you can refresh to see changing files, and the file panel refreshes automatically when work ends.
+
+The panel is read-only. **下载文件** downloads the selected file; **导出项目** exports source, static resources, dependency manifests, and lockfiles as a ZIP archive. Downloads and exports are disabled during active work; the server also checks under the same project lock as run creation/deletion and prepares a complete temporary snapshot before releasing the lock. Source access requires project ownership and is not cached.
+
+All file operations exclude dependencies (`node_modules`), generated build directories (`.next`, `dist`, `build`, `out`), coverage/caches, Git/development-session state, logs, environment files, package-registry credentials, and private-key files. `.env.example`, `.env.sample`, and `.env.template` remain included; these templates must not contain real credentials. Symbolic links and non-regular files cannot be viewed or exported. Filtering known sensitive paths is not a secret scanner: do not put credentials into ordinary source files or environment templates.
+
+Online viewing is limited to UTF-8 text up to 1 MiB. Binary/larger files show metadata and can be downloaded while idle. The file list is capped at 20,000 entries; ZIP export is capped at 10,000 files and 100 MiB of uncompressed content; a single-file download is capped at 100 MiB. Limit failures do not produce partial downloads. This release does not include source editing, version history, version switching, or rollback.
+
+Backend tests run with `go test ./...`; optional real-PostgreSQL file API tests run with `ATOMS_FILES_TEST_DATABASE_URL` set to a **dedicated disposable test database**. Frontend checks use `cd web && npm run build`.
+
+For manual browser checks without changing existing projects or using a paid model, set that test database URL and run `ATOMS_FILES_BROWSER_FIXTURE=1 go test ./internal/platform -run '^TestSourceBrowserFixture$' -v -timeout 20m`. The opt-in fixture serves the built frontend and real file APIs at `http://files-fixture.localhost:19081`, with a clearly labelled fake preview at port `19082`. Use this separate hostname to keep the normal app's login cookie unchanged. The test prints its fixture-only login; `/__fixture` provides controls for simulated work and file-list failure/recovery. The fixture stops after 15 minutes. It does not verify real model generation or a generated application's runtime.
+
 ## Point & Edit
 
 In Project Workspace, choose **Inspect UI**, hover and click an element in Preview, then describe the desired change. The selected element’s rendered tag, role, text, classes, dimensions, and key style information are passed to the next run. P0 deliberately does not map DOM elements to source lines.
