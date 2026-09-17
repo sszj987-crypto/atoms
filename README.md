@@ -45,7 +45,7 @@ All file operations exclude dependencies (`node_modules`), generated build direc
 
 Online viewing is limited to UTF-8 text up to 1 MiB. Binary/larger files show metadata and can be downloaded while idle. The file list is capped at 20,000 entries; ZIP export is capped at 10,000 files and 100 MiB of uncompressed content; a single-file download is capped at 100 MiB. Limit failures do not produce partial downloads. This release does not include source editing, version history, version switching, or rollback.
 
-Backend tests run with `go test ./...`; optional real-PostgreSQL file API tests run with `ATOMS_FILES_TEST_DATABASE_URL` set to a **dedicated disposable test database**. Frontend checks use `cd web && npm run build`.
+Backend tests run with `go test ./...`; optional real-PostgreSQL file API tests run with `ATOMS_FILES_TEST_DATABASE_URL` set to a **dedicated disposable test database**. Frontend checks use `cd web && npm test && npm run build`; the search tests use Node's TypeScript type stripping.
 
 For manual browser checks without changing existing projects or using a paid model, set that test database URL and run `ATOMS_FILES_BROWSER_FIXTURE=1 go test ./internal/platform -run '^TestSourceBrowserFixture$' -v -timeout 20m`. The opt-in fixture serves the built frontend and real file APIs at `http://files-fixture.localhost:19081`, with a clearly labelled fake preview at port `19082`. Use this separate hostname to keep the normal app's login cookie unchanged. The test prints its fixture-only login; `/__fixture` provides controls for simulated work and file-list failure/recovery. The fixture stops after 15 minutes. It does not verify real model generation or a generated application's runtime.
 
