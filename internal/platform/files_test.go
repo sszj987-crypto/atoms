@@ -36,6 +36,9 @@ func sourceFixture(t *testing.T, files map[string][]byte) (string, *os.Root) {
 }
 
 func TestSourcePathPolicy(t *testing.T) {
+	if sourcePathAllowed(".next-dev/types/routes.d.ts") {
+		t.Fatal("development build must be excluded")
+	}
 	for _, name := range []string{"app/page.tsx", "pnpm-lock.yaml", "package.json", "public/中文 图片.svg", ".env.example", "config/.env.sample", ".env.template", ".gitignore", "AGENTS.md"} {
 		if !sourcePathAllowed(name) {
 			t.Errorf("allowed path rejected: %q", name)

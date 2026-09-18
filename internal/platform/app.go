@@ -84,6 +84,10 @@ func NewApp(ctx context.Context, cfg Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("recover interrupted runs: %w", err)
 	}
+	if err := projects.recoverRestores(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("recover project restores: %w", err)
+	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	projects.startCleanup(lifecycleCtx)
 	return &App{cfg: cfg, db: db, auth: newAuthService(db, cfg.SessionKey, cfg.DeployPortBase, cfg.DeployPortSpan), model: model, projects: projects, chat: chat, cancel: lifecycleCancel}, nil
@@ -103,7 +107,10 @@ func (a *App) Close() {
 func (a *App) Shutdown(ctx context.Context) error {
 	a.shutdown.Do(func() {
 		a.cancel()
-		a.stopErr = a.chat.shutdown(ctx)
+		a.stopErr = a.projects.shutdownRestores(ctx)
+		if err := a.chat.shutdown(ctx); a.stopErr == nil {
+			a.stopErr = err
+		}
 	})
 	return a.stopErr
 }
@@ -183,6 +190,10 @@ func (a *App) platformHandler() http.Handler {
 			r.Patch("/project/{id}", a.projects.rename)
 			r.Delete("/project/{id}", a.projects.delete)
 			r.Get("/project/{id}/files", a.projects.files)
+			r.Get("/project/{id}/versions", a.projects.versions)
+			r.Get("/project/{id}/versions/{versionID}/thumbnail", a.projects.versionThumbnail)
+			r.Post("/project/{id}/restore", a.projects.startRestore)
+			r.Get("/project/{id}/restore/{operationID}", a.projects.getRestore)
 			r.Get("/project/{id}/file", a.projects.file)
 			r.Get("/project/{id}/file/download", a.projects.downloadFile)
 			r.Get("/project/{id}/export", a.projects.exportSource)

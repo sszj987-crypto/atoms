@@ -2,6 +2,9 @@ import { FormEvent, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { RunProgressPanel } from "./RunProgressPanel";
 import { SourceFilesPanel } from "./SourceFilesPanel";
+import { VersionHistoryDrawer, VersionRestoreNotice, useVersionHistory, restoreIsBusy } from "./VersionHistory";
+import { WorkspaceHeader } from "./WorkspaceHeader";
+import { currentVersionNumber } from "./versionHistoryState";
 import "./styles.css";
 import "./phase2.css";
 import "./phase3.css";
@@ -60,6 +63,16 @@ const api = async <T,>(path: string, init?: RequestInit, timeoutMs = 30_000): Pr
 const errorText = (e: unknown) => {
   const m = e instanceof Error ? e.message : "REQUEST_FAILED";
   const zh: Record<string, string> = {
+    VERSION_READ_FAILED: "读取历史版本失败",
+    VERSION_SAVE_FAILED: "保存项目初始版本失败",
+    VERSION_NOT_FOUND: "历史版本不存在或已清理",
+    RESTORE_CREATE_FAILED: "提交版本恢复失败",
+    INVALID_RESTORE: "恢复请求无效",
+    RESTORE_REQUEST_CONFLICT: "恢复请求已变化，请重新选择版本",
+    SOURCE_REVISION_CHANGED: "项目已发生变化，请检查最新版本后重试",
+    VERSION_ALREADY_CURRENT: "该版本已经是当前版本",
+    PROJECT_BUSY: "项目正在执行任务或恢复，请稍后重试",
+    PROJECT_RESTORING: "项目正在恢复，完成后会自动刷新文件",
     INVALID_REGISTRATION: "注册信息无效",
     INVALID_PASSWORD: "密码无效",
     EMAIL_ALREADY_REGISTERED: "该邮箱已注册",
@@ -278,6 +291,10 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
   const [runKnown, setRunKnown] = useState(false);
   const [outputPane, setOutputPane] = useState<"preview" | "files">("preview");
   const [mobilePane, setMobilePane] = useState<"chat" | "preview">("chat");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const versionHistory = useVersionHistory(project.id, reload, api, errorText, () => setReload(value => value + 1));
+  const restoring = restoreIsBusy(versionHistory.history?.restore);
+  const projectBusy = !versionHistory.known || !!versionHistory.history?.busy || versionHistory.submitting;
   const load = () => api<{ messages: { id: string; role: string; content: string }[] }>(`/project/${project.id}/messages`).then(r => setMessages(r.messages));
   useEffect(() => {
     setRun(null);
@@ -287,6 +304,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
     setStatus("正在恢复项目环境…");
     setRunKnown(false);
     setOutputPane("preview");
+    setHistoryOpen(false);
   }, [project.id]);
   useEffect(() => {
     if (run) return;
@@ -308,6 +326,8 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
   }, [initialDraft, onDraftConsumed]);
   useEffect(() => {
     let active = true;
+    if (!versionHistory.known) return;
+    if (restoring) { setPreviewURL(""); return; }
     setPreviewURL("");
     setPreviewError("");
     api<{ port: number }>(`/project/${project.id}/preview-access`, undefined, 120_000).then(r => {
@@ -319,7 +339,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
       }
     });
     return () => { active = false; };
-  }, [project.id, reload]);
+  }, [project.id, reload, restoring, versionHistory.known]);
   useEffect(() => {
     let current = true;
     load().catch(e => setChatError(errorText(e)));
@@ -387,7 +407,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
     return () => { current = false; e.close(); };
   }, [run, project.id]);
   async function send() {
-    if (!text.trim() || run || sending) return;
+    if (!text.trim() || run || sending || projectBusy) return;
     setSending(true);
     setChatError("");
     try {
@@ -405,30 +425,36 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
     try {
       const result = await api<{ status: string; runtime_reset: boolean }>(`/project/runs/${run}/cancel`, { method: "POST" });
       setStatus(result.status);
-      if (!result.runtime_reset) setChatError("任务已取消，但运行环境清理失败；请刷新预览后重试。");
+      if (!result.runtime_reset) setChatError("任务正在清理，项目暂不可修改；若持续失败，请检查运行环境后重启服务。");
     } catch (e) { setChatError(errorText(e)); }
   }
   const previewAddress = previewURL || "正在准备项目地址…";
   const runtimeIssue = status.includes("不可用") || status === "FAILED";
   return (
     <section className="workspace">
-      <header className="workspace-header">
-        <div className="workspace-title"><button className="back-button" onClick={onBack} aria-label="返回项目列表">←</button><div><p className="eyebrow">项目工作区</p><h1>{project.name}</h1></div></div>
-        <span className={`runtime ${runtimeIssue ? "issue" : ""}`}><i aria-hidden="true" />{statusText(status)}</span>
-      </header>
+      <WorkspaceHeader name={project.name} version={currentVersionNumber(versionHistory.history)} onBack={onBack}
+        issue={runtimeIssue || versionHistory.history?.restore?.status === "BLOCKED"}
+        status={restoring ? versionHistory.history?.restore?.status === "BLOCKED" ? "项目已保护" : "版本恢复中" : statusText(status)} />
+      <VersionRestoreNotice controller={versionHistory} />
       <div className="workspace-tabs" role="tablist" aria-label="工作区面板"><button role="tab" aria-selected={mobilePane === "chat"} className={mobilePane === "chat" ? "active" : ""} onClick={() => setMobilePane("chat")}>对话</button><button role="tab" aria-selected={mobilePane === "preview"} className={mobilePane === "preview" ? "active" : ""} onClick={() => setMobilePane("preview")}>预览</button></div>
       <div className="workspace-body">
         <aside className={`chat ${mobilePane !== "chat" ? "mobile-hidden" : ""}`}>
-          <div className="panel-heading"><div><span className="panel-kicker">对话</span><h2>构建记录</h2></div>{messages.length > 0 && <span>{messages.length} 条消息</span>}</div>
+          <div className="panel-heading">
+            <div><span className="panel-kicker">对话{messages.length > 0 && ` · ${messages.length} 条消息`}</span><h2>构建记录</h2></div>
+            <button type="button" className="secondary version-history-button" aria-haspopup="dialog" onClick={() => setHistoryOpen(true)}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 11a9 9 0 1 1 2.6 7.4M3 4v7h7M12 7v5l3 2" /></svg>
+              历史记录
+            </button>
+          </div>
           <div className="history">{messages.length ? messages.map(m => <div key={m.id} className={`message ${m.role}`}><span>{m.role === "user" ? "你" : "Atoms"}</span><p>{m.content}</p></div>) : <div className="chat-empty"><span aria-hidden="true">✦</span><h3>从描述需求开始</h3><p>告诉我你想构建或修改什么，执行过程会实时显示在这里。</p></div>}</div>
           {showProgress && (run || progress.length > 0) && <RunProgressPanel><strong>工作记录</strong>{progress.length ? progress.map(item => <div className={`run-step ${item.kind} ${item.status || ""}`} key={item.step_id || item.id}><span className="run-step-icon" aria-hidden="true">{item.status === "completed" ? "✓" : item.status === "failed" ? "!" : item.status === "running" ? "" : "·"}</span><div><p>{item.title}</p>{item.detail && (item.kind === "command" ? <details><summary>查看命令</summary><code>{item.detail}</code></details> : <small>{item.detail}</small>)}</div></div>) : <div className="run-step running"><span className="run-step-icon" aria-hidden="true" /><div><p>正在排队…</p></div></div>}</RunProgressPanel>}
-          {run && <div className="run-actions"><span>{statusText(status)}</span><button className="link" onClick={cancelRun}>取消任务</button></div>}
+          {run && <div className="run-actions"><span>{statusText(status)}</span><button className="link" disabled={status === "CANCELLING"} onClick={cancelRun}>取消任务</button></div>}
           {chatError && <p className="error" role="alert">{chatError}</p>}
           <div className="chat-composer"><textarea aria-label="描述项目修改" value={text} onChange={e => setText(e.target.value)} onKeyDown={e => {
             if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
             e.preventDefault();
             if (!e.repeat) void send();
-          }} placeholder="描述你想要的修改…" /><div><span>{run ? "任务完成后可继续发送" : "描述越具体，结果越准确"}</span><button onClick={send} disabled={sending || !!run || !text.trim()}>发送</button></div></div>
+          }} placeholder="描述你想要的修改…" /><div><span>{restoring ? "版本恢复完成后可继续发送" : run ? "任务完成后可继续发送" : "描述越具体，结果越准确"}</span><button onClick={send} disabled={sending || !!run || projectBusy || !text.trim()}>发送</button></div></div>
         </aside>
         <div className={`preview ${mobilePane !== "preview" ? "mobile-hidden" : ""}`}>
           <div className="workspace-output-tabs" role="tablist" aria-label="项目内容" onKeyDown={event => {
@@ -446,14 +472,15 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
             <div className="browser-dots" aria-hidden="true"><i /><i /><i /></div>
             <div className="preview-addressbar"><span aria-hidden="true">⌕</span><input aria-label="项目预览地址" readOnly value={previewAddress} /></div>
             <div className="preview-actions">
-              <button className="icon-button" aria-label="刷新预览" title="刷新预览" onClick={refreshPreview}>↻</button>
+              <button className="icon-button" disabled={restoring || !versionHistory.known} aria-label="刷新预览" title="刷新预览" onClick={refreshPreview}>↻</button>
             </div>
           </div>
-          {previewURL ? <iframe key={reload} title="项目预览" src={previewURL} /> : previewError ? <div className="preview-loading" role="alert"><p>{previewError}</p><button onClick={refreshPreview}>重新启动</button></div> : <div className="preview-loading" role="status"><span className="spinner" aria-hidden="true" /><p>正在启动项目预览…</p></div>}
+          {previewURL ? <iframe key={reload} title="项目预览" src={previewURL} /> : previewError ? <div className="preview-loading" role="alert"><p>{previewError}</p><button disabled={restoring || !versionHistory.known} onClick={refreshPreview}>重新启动</button></div> : <div className="preview-loading" role="status"><span className="spinner" aria-hidden="true" /><p>{restoring ? "版本恢复完成后重新载入预览…" : "正在启动项目预览…"}</p></div>}
           </div>
-          <SourceFilesPanel key={project.id} projectID={project.id} visible={outputPane === "files"} runActive={runKnown ? !!run || sending : null} refreshKey={reload} request={api} formatError={errorText} />
+          <SourceFilesPanel key={project.id} projectID={project.id} visible={outputPane === "files"} restoring={restoring} runActive={runKnown && versionHistory.known ? !!run || sending || projectBusy : null} refreshKey={reload} request={api} formatError={errorText} />
         </div>
       </div>
+      <VersionHistoryDrawer projectID={project.id} open={historyOpen} onClose={() => setHistoryOpen(false)} controller={versionHistory} />
     </section>
   );
 }

@@ -23,6 +23,7 @@ type chatService struct {
 	projects *projectService
 	mu       sync.Mutex
 	cancels  map[string]context.CancelFunc
+	done     map[string]chan struct{}
 }
 
 type runProgressEvent struct {
@@ -39,7 +40,7 @@ type codexFileChange struct {
 }
 
 func newChatService(p *projectService) *chatService {
-	return &chatService{projects: p, cancels: make(map[string]context.CancelFunc)}
+	return &chatService{projects: p, cancels: make(map[string]context.CancelFunc), done: make(map[string]chan struct{})}
 }
 func (s *chatService) messages(w http.ResponseWriter, r *http.Request) {
 	u := r.Context().Value(currentUserKey{}).(User)
@@ -97,12 +98,25 @@ func (s *chatService) send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var active bool
-	if e = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, p.ID).Scan(&active); e != nil {
+	if e = tx.QueryRow(r.Context(), `SELECT `+projectBusySQL, p.ID).Scan(&active); e != nil {
 		apiError(w, 500, "RUN_READ_FAILED")
 		return
 	}
 	if active {
 		apiError(w, 409, "AGENT_RUN_IN_PROGRESS")
+		return
+	}
+	owned, e := projectOwned(r.Context(), tx, p.ID, u.ID)
+	if e != nil || !owned {
+		apiError(w, 404, "PROJECT_NOT_FOUND")
+		return
+	}
+	if e = s.projects.ensureBaseline(r.Context(), tx, p); e != nil {
+		apiError(w, 500, "VERSION_SAVE_FAILED")
+		return
+	}
+	if _, e = tx.Exec(r.Context(), `UPDATE projects SET source_revision=source_revision+1 WHERE id=$1`, p.ID); e != nil {
+		apiError(w, 500, "RUN_CREATE_FAILED")
 		return
 	}
 	_, e = tx.Exec(r.Context(), `INSERT INTO messages(id,project_id,role,content,selected_ui) VALUES($1,$2,'user',$3,$4)`, mid, p.ID, in.Content, in.SelectedUI)
@@ -128,6 +142,7 @@ func (s *chatService) send(w http.ResponseWriter, r *http.Request) {
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.mu.Lock()
 	s.cancels[rid] = cancel
+	s.done[rid] = make(chan struct{})
 	s.mu.Unlock()
 	go func() {
 		defer s.unregisterRun(rid)
@@ -142,6 +157,10 @@ func activeRunConflict(err error) bool {
 func (s *chatService) unregisterRun(runID string) {
 	s.mu.Lock()
 	delete(s.cancels, runID)
+	if done := s.done[runID]; done != nil {
+		close(done)
+		delete(s.done, runID)
+	}
 	s.mu.Unlock()
 }
 func (s *chatService) cancelLocalRun(runID string) {
@@ -264,7 +283,7 @@ func (s *chatService) run(ctx context.Context, p Project, userID, runID, prompt 
 	if summary == "" {
 		summary = "应用更新完成。"
 	}
-	s.complete(runID, p.ID, summary)
+	s.complete(runID, p, summary, prompt)
 }
 
 func (s *chatService) transitionRun(ctx context.Context, runID, status string) bool {
@@ -324,22 +343,60 @@ func (s *chatService) verify(ctx context.Context, p Project, runID string) error
 	return nil
 }
 func (s *chatService) fail(id, msg string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	tag, err := s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='FAILED',error_message=$2,finished_at=now() WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')`, id, msg)
+	var projectID string
+	if err := s.projects.db.QueryRow(ctx, `SELECT project_id FROM agent_runs WHERE id=$1`, id).Scan(&projectID); err != nil {
+		return
+	}
+	tx, err := s.projects.db.Begin(ctx)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback(ctx)
+	if err = projectLock(ctx, tx, projectID); err != nil {
+		return
+	}
+	tag, err := tx.Exec(ctx, `UPDATE agent_runs SET status='CANCELLING',error_message=$2 WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')`, id, msg)
+	if err != nil || tag.RowsAffected() == 0 {
+		return
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return
+	}
+	s.cancelLocalRun(id)
+	if err = s.projects.restoreRuntime().Stop(ctx, Project{ID: projectID}); err != nil {
+		s.progress(ctx, id, "任务清理未完成，项目已保护，请检查运行环境后重启服务。")
+		return
+	}
+	tag, err = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='FAILED',error_message=$2,finished_at=now() WHERE id=$1 AND status='CANCELLING'`, id, msg)
 	if err == nil && tag.RowsAffected() > 0 {
 		s.progress(ctx, id, msg)
 	}
 }
-func (s *chatService) complete(runID, projectID, summary string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func (s *chatService) complete(runID string, p Project, summary, prompt string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	thumbnail := s.projects.restoreRuntime().Capture(ctx, p)
 	saved, err := func() (bool, error) {
 		tx, err := s.projects.db.Begin(ctx)
 		if err != nil {
 			return false, err
 		}
 		defer tx.Rollback(ctx)
+		if err = projectLock(ctx, tx, p.ID); err != nil {
+			return false, err
+		}
+		var active bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agent_runs WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, runID).Scan(&active); err != nil {
+			return false, err
+		}
+		if !active {
+			return false, nil
+		}
+		if _, err = s.projects.saveVersion(ctx, tx, p, prompt, &runID, thumbnail); err != nil {
+			return false, err
+		}
 		tag, err := tx.Exec(ctx, `UPDATE agent_runs SET status='COMPLETED',finished_at=now() WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')`, runID)
 		if err != nil {
 			return false, err
@@ -347,7 +404,7 @@ func (s *chatService) complete(runID, projectID, summary string) {
 		if tag.RowsAffected() == 0 {
 			return false, nil
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO messages(id,project_id,role,content) VALUES($1,$2,'assistant',$3)`, newID(), projectID, summary); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO messages(id,project_id,role,content) VALUES($1,$2,'assistant',$3)`, newID(), p.ID, summary); err != nil {
 			return false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -356,11 +413,14 @@ func (s *chatService) complete(runID, projectID, summary string) {
 		return true, nil
 	}()
 	if err != nil {
-		s.fail(runID, "Run result could not be saved.")
+		s.fail(runID, "版本或任务结果保存失败，请重试。")
 		return
 	}
 	if saved {
 		s.progress(ctx, runID, "已完成。")
+		if err := s.projects.cleanVersionStore(ctx, p); err != nil {
+			log.Printf("version cleanup deferred project_id=%s", p.ID)
+		}
 	}
 }
 func (s *chatService) progress(ctx context.Context, runID, message string) {
@@ -588,7 +648,7 @@ func (s *chatService) activeRun(w http.ResponseWriter, r *http.Request) {
 		FROM agent_runs r
 		JOIN projects p ON p.id=r.project_id
 		WHERE r.project_id=$1 AND p.user_id=$2
-		  AND r.status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')
+		  AND r.status IN ('PENDING','RUNNING','VERIFYING','REPAIRING','CANCELLING')
 		ORDER BY r.started_at DESC
 		LIMIT 1
 	`, chi.URLParam(r, "id"), u.ID).Scan(&v.ID, &v.ProjectID, &v.Status, &v.ErrorMessage, &v.StartedAt, &v.FinishedAt)
@@ -673,7 +733,17 @@ func (s *chatService) cancel(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 409, "RUN_NOT_ACTIVE")
 		return
 	}
-	tag, e := s.projects.db.Exec(r.Context(), `UPDATE agent_runs SET status='CANCELLED',finished_at=now() WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')`, run.ID)
+	tx, e := s.projects.db.Begin(r.Context())
+	if e != nil {
+		apiError(w, 500, "RUN_CANCEL_FAILED")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if e = projectLock(r.Context(), tx, run.ProjectID); e != nil {
+		apiError(w, 500, "RUN_CANCEL_FAILED")
+		return
+	}
+	tag, e := tx.Exec(r.Context(), `UPDATE agent_runs SET status='CANCELLING' WHERE id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')`, run.ID)
 	if e != nil {
 		apiError(w, 500, "RUN_CANCEL_FAILED")
 		return
@@ -682,15 +752,38 @@ func (s *chatService) cancel(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusConflict, "RUN_NOT_ACTIVE")
 		return
 	}
+	if e = tx.Commit(r.Context()); e != nil {
+		apiError(w, 500, "RUN_CANCEL_FAILED")
+		return
+	}
 	s.cancelLocalRun(run.ID)
-	resetCtx, resetCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	resetCtx, resetCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer resetCancel()
 	runtimeReset := true
-	if err := s.projects.removeRuntime(resetCtx, run.ProjectID); err != nil {
+	if err := s.projects.restoreRuntime().Stop(resetCtx, Project{ID: run.ProjectID}); err != nil {
 		runtimeReset = false
 		log.Printf("cancel runtime cleanup failed run_id=%s project_id=%s: %v", run.ID, run.ProjectID, err)
 	}
-	writeJSON(w, 200, map[string]any{"status": "CANCELLED", "runtime_reset": runtimeReset})
+	s.mu.Lock()
+	done := s.done[run.ID]
+	s.mu.Unlock()
+	if runtimeReset && done != nil {
+		select {
+		case <-done:
+		case <-resetCtx.Done():
+			runtimeReset = false
+		}
+	}
+	if !runtimeReset {
+		s.progress(resetCtx, run.ID, "正在清理取消的任务，项目暂不可修改。")
+		writeJSON(w, 202, map[string]any{"status": "CANCELLING", "runtime_reset": false})
+		return
+	}
+	if _, e = s.projects.db.Exec(resetCtx, `UPDATE agent_runs SET status='CANCELLED',finished_at=now() WHERE id=$1 AND status='CANCELLING'`, run.ID); e != nil {
+		apiError(w, 500, "RUN_CANCEL_FAILED")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"status": "CANCELLED", "runtime_reset": true})
 }
 
 type runView struct {
@@ -713,12 +806,7 @@ func (s *chatService) ownedRun(w http.ResponseWriter, r *http.Request) (runView,
 	return v, true
 }
 func (s *chatService) recoverInterruptedRuns(ctx context.Context) error {
-	rows, err := s.projects.db.Query(ctx, `
-		UPDATE agent_runs
-		SET status='FAILED', error_message='服务重启导致任务中断，请重新提交。', finished_at=now()
-		WHERE status IN ('PENDING','RUNNING','VERIFYING','REPAIRING')
-		RETURNING project_id
-	`)
+	rows, err := s.projects.db.Query(ctx, `SELECT DISTINCT project_id FROM agent_runs WHERE status IN ('PENDING','RUNNING','VERIFYING','REPAIRING','CANCELLING')`)
 	if err != nil {
 		return err
 	}
@@ -742,6 +830,9 @@ func (s *chatService) recoverInterruptedRuns(ctx context.Context) error {
 		cancel()
 		if err != nil {
 			return fmt.Errorf("remove interrupted runtime %s: %w", projectID, err)
+		}
+		if _, err = s.projects.db.Exec(ctx, `UPDATE agent_runs SET status='FAILED',error_message='服务重启导致任务中断，请重新提交。',finished_at=now() WHERE project_id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING','CANCELLING')`, projectID); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -39,16 +39,21 @@ type Project struct {
 	DeployPort           int       `json:"-"`
 }
 type projectService struct {
-	db           *pgxpool.Pool
-	cfg          Config
-	docker       *dockerClient
-	model        *modelService
-	mu           sync.Mutex
-	runtimeLocks map[string]*sync.Mutex
+	db             *pgxpool.Pool
+	cfg            Config
+	docker         *dockerClient
+	model          *modelService
+	mu             sync.Mutex
+	runtimeLocks   map[string]*sync.Mutex
+	versionRuntime versionRuntime
+	restoreCtx     context.Context
+	restoreCancel  context.CancelFunc
+	restoreWorkers sync.WaitGroup
 }
 
 func newProjectService(db *pgxpool.Pool, cfg Config, model *modelService) *projectService {
-	return &projectService{db: db, cfg: cfg, docker: newDockerClient(), model: model, runtimeLocks: make(map[string]*sync.Mutex)}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &projectService{db: db, cfg: cfg, docker: newDockerClient(), model: model, runtimeLocks: make(map[string]*sync.Mutex), restoreCtx: ctx, restoreCancel: cancel}
 }
 
 func (s *projectService) get(w http.ResponseWriter, r *http.Request) {
@@ -154,8 +159,17 @@ func (s *projectService) delete(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, "PROJECT_DELETE_FAILED")
 		return
 	}
+	owned, err := projectOwned(r.Context(), tx, p.ID, u.ID)
+	if err != nil {
+		apiError(w, 500, "PROJECT_DELETE_FAILED")
+		return
+	}
+	if !owned {
+		apiError(w, 404, "PROJECT_NOT_FOUND")
+		return
+	}
 	var active bool
-	if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, p.ID).Scan(&active); err != nil {
+	if err := tx.QueryRow(r.Context(), `SELECT `+projectBusySQL, p.ID).Scan(&active); err != nil {
 		apiError(w, http.StatusInternalServerError, "PROJECT_DELETE_FAILED")
 		return
 	}
@@ -220,17 +234,21 @@ func (s *projectService) restart(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 500, "PROJECT_READ_FAILED")
 		return
 	}
-	active, err := s.hasActiveRun(r.Context(), p.ID)
-	if err != nil {
-		apiError(w, 500, "RUN_READ_FAILED")
+	tx, ok := s.idleProject(w, r, p)
+	if !ok {
 		return
 	}
-	if active {
-		apiError(w, 409, "RUN_IN_PROGRESS")
-		return
-	}
+	defer tx.Rollback(r.Context())
 	if err = s.recreateRuntime(r.Context(), p); err != nil {
 		apiError(w, 503, "RUNTIME_UNAVAILABLE")
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `UPDATE projects SET last_accessed_at=now() WHERE id=$1`, p.ID); err != nil {
+		apiError(w, 500, "PROJECT_READ_FAILED")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		apiError(w, 500, "PROJECT_READ_FAILED")
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "starting"})
@@ -245,17 +263,21 @@ func (s *projectService) deploy(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 500, "PROJECT_READ_FAILED")
 		return
 	}
-	active, err := s.hasActiveRun(r.Context(), p.ID)
-	if err != nil {
-		apiError(w, 500, "RUN_READ_FAILED")
+	tx, ok := s.idleProject(w, r, p)
+	if !ok {
 		return
 	}
-	if active {
-		apiError(w, 409, "RUN_IN_PROGRESS")
-		return
-	}
+	defer tx.Rollback(r.Context())
 	if err := s.recreateRuntime(r.Context(), p); err != nil {
 		apiError(w, 503, "RUNTIME_UNAVAILABLE")
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `UPDATE projects SET last_accessed_at=now() WHERE id=$1`, p.ID); err != nil {
+		apiError(w, 500, "PROJECT_READ_FAILED")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		apiError(w, 500, "PROJECT_READ_FAILED")
 		return
 	}
 	writeJSON(w, 200, map[string]string{"port": strconv.Itoa(p.DeployPort)})
@@ -357,6 +379,9 @@ func (s *projectService) createProject(ctx context.Context, userID, name string)
 	if _, err = tx.Exec(ctx, `INSERT INTO projects(id,user_id,name,workspace_path,codex_state_path,last_accessed_at,db_schema,db_username,db_password_ciphertext,deploy_port) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, p.ID, userID, p.Name, p.WorkspacePath, p.CodexStatePath, p.LastAccessedAt, p.DBSchema, p.DBUsername, p.DBPasswordCiphertext, p.DeployPort); err != nil {
 		return Project{}, err
 	}
+	if err = s.ensureBaseline(ctx, tx, p); err != nil {
+		return Project{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Project{}, err
 	}
@@ -407,10 +432,34 @@ func (s *projectService) byID(ctx context.Context, userID, projectID string) (Pr
 	return p, err
 }
 func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err = projectLock(ctx, tx, p.ID); err != nil {
+		return err
+	}
+	var exists, busy bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1), (`+restoreBusySQL+` OR EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status='CANCELLING'))`, p.ID).Scan(&exists, &busy); err != nil {
+		return err
+	}
+	if !exists {
+		return pgx.ErrNoRows
+	}
+	if busy && ctx.Value(restoreContextKey{}) != p.ID {
+		return errProjectBusy
+	}
 	lock := s.runtimeLock(p.ID)
 	lock.Lock()
 	defer lock.Unlock()
-	return s.ensureRuntimeLocked(ctx, p)
+	if err = s.ensureRuntimeLocked(ctx, p); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE projects SET last_accessed_at=now() WHERE id=$1 AND last_accessed_at < now() - interval '5 minutes'`, p.ID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 func (s *projectService) ensureRuntimeLocked(ctx context.Context, p Project) error {
 	status, err := s.docker.inspect(ctx, runtimeName(p.ID))
@@ -437,7 +486,6 @@ func (s *projectService) ensureRuntimeLocked(ctx context.Context, p Project) err
 		log.Printf("ensureRuntime createAndStart failed project=%s deployPort=%d err=%v", p.ID, p.DeployPort, err)
 		return err
 	}
-	s.touch(ctx, p.ID)
 	return nil
 }
 func (s *projectService) recreateRuntime(ctx context.Context, p Project) error {
@@ -467,7 +515,7 @@ func (s *projectService) runtimeLock(projectID string) *sync.Mutex {
 }
 func (s *projectService) hasActiveRun(ctx context.Context, projectID string) (bool, error) {
 	var active bool
-	err := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, projectID).Scan(&active)
+	err := s.db.QueryRow(ctx, `SELECT `+projectBusySQL, projectID).Scan(&active)
 	return active, err
 }
 func waitRuntimeReady(ctx context.Context, projectID string) error {
@@ -498,21 +546,46 @@ func (s *projectService) touch(ctx context.Context, id string) {
 	_, _ = s.db.Exec(ctx, `UPDATE projects SET last_accessed_at=now() WHERE id=$1 AND last_accessed_at < now() - interval '5 minutes'`, id)
 }
 func (s *projectService) cleanup(ctx context.Context) error {
-	rows, err := s.db.Query(ctx, `SELECT id FROM projects WHERE last_accessed_at < now() - $1::interval AND NOT EXISTS (SELECT 1 FROM agent_runs WHERE agent_runs.project_id=projects.id AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, durationInterval(s.cfg.RuntimeIdleTTL))
+	rows, err := s.db.Query(ctx, `SELECT id FROM projects WHERE last_accessed_at < now() - $1::interval`, durationInterval(s.cfg.RuntimeIdleTTL))
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return err
 		}
-		if err := s.removeRuntime(ctx, id); err != nil {
-			return err
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		tx, e := s.db.Begin(ctx)
+		if e != nil {
+			return e
+		}
+		if e = projectLock(ctx, tx, id); e != nil {
+			tx.Rollback(ctx)
+			return e
+		}
+		busy, e := projectBusy(ctx, tx, id)
+		var idle bool
+		if e == nil {
+			e = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1 AND last_accessed_at < now() - $2::interval)`, id, durationInterval(s.cfg.RuntimeIdleTTL)).Scan(&idle)
+		}
+		if e == nil && !busy && idle {
+			e = s.removeRuntime(ctx, id)
+		}
+		tx.Rollback(ctx)
+		if e != nil {
+			return e
 		}
 	}
-	return rows.Err()
+	return nil
 }
 func (s *projectService) startCleanup(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.RuntimeSweepInterval)
@@ -526,6 +599,7 @@ func (s *projectService) startCleanup(ctx context.Context) {
 				if err := s.cleanup(ctx); err != nil && ctx.Err() == nil {
 					log.Printf("runtime cleanup failed: %v", err)
 				}
+				s.collectVersions(ctx)
 			}
 		}
 	}()

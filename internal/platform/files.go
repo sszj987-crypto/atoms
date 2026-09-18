@@ -55,7 +55,7 @@ func sourcePathAllowed(name string) bool {
 	for _, part := range strings.Split(name, "/") {
 		lower := strings.ToLower(part)
 		switch lower {
-		case "node_modules", ".next", "dist", "build", "out", "coverage", ".cache", ".turbo", ".vite", ".pnpm-store", ".git", ".codex", "codex", ".atoms", "logs", ".ssh", ".aws", ".vercel", ".netlify", ".npmrc", ".pnpmrc", ".yarnrc", ".yarnrc.yml", ".ds_store", "id_rsa", "id_ed25519", "credentials.json", "secrets.json":
+		case "node_modules", ".next", ".next-dev", "dist", "build", "out", "coverage", ".cache", ".turbo", ".vite", ".pnpm-store", ".git", ".codex", "codex", ".atoms", "logs", ".ssh", ".aws", ".vercel", ".netlify", ".npmrc", ".pnpmrc", ".yarnrc", ".yarnrc.yml", ".ds_store", "id_rsa", "id_ed25519", "credentials.json", "secrets.json":
 			return false
 		}
 		if strings.HasPrefix(lower, ".atoms-") || strings.HasPrefix(lower, ".env") && lower != ".env.example" && lower != ".env.sample" && lower != ".env.template" {
@@ -321,6 +321,11 @@ func (s *projectService) files(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	tx, ok := s.sourceReadLock(w, r, p)
+	if !ok {
+		return
+	}
+	defer tx.Rollback(r.Context())
 	root, err := os.OpenRoot(p.WorkspacePath)
 	if err != nil {
 		sourceError(w, err)
@@ -345,6 +350,11 @@ func (s *projectService) file(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	tx, ok := s.sourceReadLock(w, r, p)
+	if !ok {
+		return
+	}
+	defer tx.Rollback(r.Context())
 	root, err := os.OpenRoot(p.WorkspacePath)
 	if err != nil {
 		sourceError(w, err)
@@ -385,7 +395,7 @@ func (s *projectService) sourceDownload(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	var exists, active bool
-	err = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1 AND user_id=$2), EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status IN ('PENDING','RUNNING','VERIFYING','REPAIRING'))`, p.ID, r.Context().Value(currentUserKey{}).(User).ID).Scan(&exists, &active)
+	err = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1 AND user_id=$2), `+projectBusySQL, p.ID, r.Context().Value(currentUserKey{}).(User).ID).Scan(&exists, &active)
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, "SOURCE_EXPORT_FAILED")
 		return
@@ -436,4 +446,27 @@ func (s *projectService) sourceDownload(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
 	http.ServeContent(w, r, filename, time.Time{}, temp)
+}
+func (s *projectService) sourceReadLock(w http.ResponseWriter, r *http.Request, p Project) (pgx.Tx, bool) {
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		apiError(w, 500, "FILE_READ_FAILED")
+		return nil, false
+	}
+	if err = projectLock(r.Context(), tx, p.ID); err != nil {
+		tx.Rollback(r.Context())
+		apiError(w, 500, "FILE_READ_FAILED")
+		return nil, false
+	}
+	var busy bool
+	if err = tx.QueryRow(r.Context(), `SELECT `+restoreBusySQL, p.ID).Scan(&busy); err != nil || busy {
+		tx.Rollback(r.Context())
+		if busy {
+			apiError(w, 409, "PROJECT_RESTORING")
+		} else {
+			apiError(w, 500, "FILE_READ_FAILED")
+		}
+		return nil, false
+	}
+	return tx, true
 }

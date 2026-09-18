@@ -7,6 +7,7 @@ type Props = {
   projectID: string;
   visible: boolean;
   runActive: boolean | null;
+  restoring?: boolean;
   refreshKey: number;
   request: <T>(path: string, init?: RequestInit, timeoutMs?: number) => Promise<T>;
   formatError: (error: unknown) => string;
@@ -18,7 +19,7 @@ function sizeText(size: number) {
   return `${(size / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-export function SourceFilesPanel({ projectID, visible, runActive, refreshKey, request, formatError }: Props) {
+export function SourceFilesPanel({ projectID, visible, runActive, restoring = false, refreshKey, request, formatError }: Props) {
   const [files, setFiles] = useState<SourceEntry[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -45,6 +46,7 @@ export function SourceFilesPanel({ projectID, visible, runActive, refreshKey, re
   useEffect(() => {
     if (visible) everVisible.current = true;
     if (!everVisible.current) return;
+    if (restoring) { setLoading(false); return; }
     const controller = new AbortController();
     setLoading(true);
     setListError("");
@@ -61,13 +63,13 @@ export function SourceFilesPanel({ projectID, visible, runActive, refreshKey, re
       if (!controller.signal.aborted) setLoading(false);
     });
     return () => controller.abort();
-  }, [projectID, visible, refreshKey, listRefresh, request, formatError]);
+  }, [projectID, visible, restoring, refreshKey, listRefresh, request, formatError]);
 
   useEffect(() => {
     setFile(null);
     setFileError("");
     setDownloadError("");
-    if (!selected) { setFileLoading(false); return; }
+    if (!selected || restoring) { setFileLoading(false); return; }
     const controller = new AbortController();
     setFileLoading(true);
     request<SourceFile>(`/project/${projectID}/file?path=${encodeURIComponent(selected)}`, { signal: controller.signal }).then(result => {
@@ -78,7 +80,7 @@ export function SourceFilesPanel({ projectID, visible, runActive, refreshKey, re
       if (!controller.signal.aborted) setFileLoading(false);
     });
     return () => controller.abort();
-  }, [projectID, selected, revision, fileRefresh, request, formatError]);
+  }, [projectID, selected, restoring, revision, fileRefresh, request, formatError]);
 
   useEffect(() => {
     codeScroll.current?.scrollTo(0, 0);
@@ -86,7 +88,7 @@ export function SourceFilesPanel({ projectID, visible, runActive, refreshKey, re
 
   useEffect(() => () => { downloadGeneration.current++; downloadController.current?.abort(); }, []);
 
-  const busy = runActive !== false || serverRunActive;
+  const busy = restoring || runActive !== false || serverRunActive;
   useEffect(() => {
     if (busy && downloadController.current) {
       downloadGeneration.current++;
@@ -175,15 +177,16 @@ export function SourceFilesPanel({ projectID, visible, runActive, refreshKey, re
 
   return <div className="source-panel" hidden={!visible} role="tabpanel" id="workspace-files" aria-labelledby="workspace-files-tab">
     <div className="source-toolbar">
-      <div className="source-toolbar-info"><button type="button" className="secondary source-tree-toggle" aria-expanded={treeVisible} aria-controls="source-file-tree" onClick={() => setTreeVisible(value => !value)}>{treeVisible ? "收起文件树" : "展开文件树"}</button><div><span className="panel-kicker">项目源码 · 只读</span>{(runActive === null || busy) && <p role="status">{runActive === null ? "正在确认任务状态…" : "开发中，文件可能变化"}</p>}</div></div>
+      <div className="source-toolbar-info"><button type="button" className="secondary source-tree-toggle" aria-expanded={treeVisible} aria-controls="source-file-tree" onClick={() => setTreeVisible(value => !value)}>{treeVisible ? "收起文件树" : "展开文件树"}</button><div><span className="panel-kicker">项目源码 · 只读</span>{(runActive === null || busy) && <p role="status">{restoring ? "正在恢复项目…" : runActive === null ? "正在确认任务状态…" : "开发中，文件可能变化"}</p>}</div></div>
       <div className="source-actions">
-        <button type="button" className="secondary" disabled={loading} onClick={() => setListRefresh(value => value + 1)}>刷新文件</button>
+        <button type="button" className="secondary" disabled={loading || restoring} onClick={() => setListRefresh(value => value + 1)}>刷新文件</button>
         <button type="button" className="secondary" disabled={busy || !!downloading || !selected || fileLoading || !!fileError} title={busy ? "任务完成后可下载" : "下载选中文件"} onClick={() => void download("file")}>{downloading === "file" ? "下载中…" : "下载文件"}</button>
         <button type="button" disabled={busy || !!downloading || !loaded || !!listError || loading} title={busy ? "任务完成后可导出" : "不包含依赖、构建产物或密钥"} onClick={() => void download("zip")}>{downloading === "zip" ? "导出中…" : "导出项目"}</button>
       </div>
     </div>
     {downloadError && <p className="source-error error" role="alert">{downloadError}</p>}
-    {listError ? <div className="source-empty" role="alert"><p>{listError}</p><button type="button" onClick={() => setListRefresh(value => value + 1)}>重试</button></div>
+    {restoring ? <div className="source-empty" role="status"><span className="spinner" /><p>正在恢复项目，完成后自动刷新文件。</p></div>
+      : listError ? <div className="source-empty" role="alert"><p>{listError}</p><button type="button" onClick={() => setListRefresh(value => value + 1)}>重试</button></div>
       : !loaded && loading ? <div className="source-empty" role="status"><span className="spinner" aria-hidden="true" /><p>正在读取项目文件…</p></div>
       : loaded && files.length === 0 ? <div className="source-empty"><h3>暂无源码文件</h3><p>项目文件生成后会显示在这里。</p></div>
       : <div className={`source-body${treeVisible ? "" : " source-body-tree-hidden"}`} aria-busy={loading}>

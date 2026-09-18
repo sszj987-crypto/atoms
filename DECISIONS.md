@@ -13,7 +13,13 @@
 - Preview and a read-only Files panel share the workspace's right pane; Preview is the default tab. Switching tabs must retain the preview iframe and file selection.
 - Files supports source viewing, single-file downloads, and source ZIP export from the same workspace used by Preview, even without a Runtime.
 - Downloads and export require an idle project and snapshot files under the same project advisory lock as run creation and deletion. Dependencies, build artifacts, caches, logs, session state, secrets, and symbolic links are excluded.
-- Files does not support editing, version history, version switching, or rollback in this release.
+- Files does not support editing. Project history supports source restore, not historical source browsing or a separate historical Preview.
+- Verified successful tasks save immutable source ZIPs, manifests and optional fixed homepage screenshots before completion. New projects have an initial version; existing projects get a baseline before their first new task. Failed/cancelled tasks do not create versions.
+- History is a 480px left drawer (bounded by mobile width) beside the workspace project name. Selection alone never modifies the project. Restore is the only switch/rollback action and requires confirmation.
+- Keep at most 10 versions with monotonic numbers; protect the current version. Restore creates no new version; subsequent successful work branches from the restored version.
+- Restore replaces actual source and rebuilds/checks Preview, not business data, current secrets or visible chat. Overwritten unversioned source does not become a history backup. Screenshots show only the saved homepage, never historical business data.
+- Durable restore operations share the project database lock/busy state with tasks, cancellation cleanup, deletion, download/export, restart/deploy, Preview startup and idle cleanup. Revision checks and idempotency prevent conflicting requests.
+- Keep the complete previous workspace temporarily for failed/interrupted restore compensation. Startup compensates unfinished replacement before enabling writes; compensation failure leaves the project protected.
 - Product UI must not expose the internal Coding Agent implementation.
 - Point & Edit is a P0 feature.
 - Point & Edit does not implement DOM-to-source-code mapping in P0.
@@ -58,7 +64,8 @@ Data layout:
 /data/users/{user_id}/projects/{project_id}/
 ├── workspace/
 ├── codex/
-└── logs/
+├── logs/
+└── versions/  # source ZIPs, manifests, optional thumbnails; not mounted into Runtime
 ```
 
 ## Runtime
@@ -72,6 +79,7 @@ Data layout:
 - Runtime PID limit: 256.
 - Runtime does not mount Docker Socket.
 - Runtime runs as non-root.
+- Runtime includes headless Chromium for fixed local homepage screenshots (1280×720, 10-second timeout, no platform credentials or user-provided URL). Screenshot failure must not fail source snapshot saving.
 - Runtime joins `atoms-internal`.
 - Runtime is destroyed after 24 hours without access.
 - Destroying Runtime must not delete:
@@ -98,7 +106,7 @@ Data layout:
 - Do not implement custom file/shell/tool calling infrastructure.
 - Each project uses one persistent Codex Session / Thread.
 - Codex session state must be persisted outside the disposable Runtime filesystem.
-- Resume the same project Codex Session after Runtime recreation.
+- Resume the same project Codex Session after normal Runtime recreation. Successful source restore archives that session outside Runtime and starts a fresh one without deleting visible chat.
 - Use Codex's own context management and compaction.
 - Do not implement:
   - `.atoms/context.md`;
