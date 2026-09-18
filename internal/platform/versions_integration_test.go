@@ -18,6 +18,8 @@ import (
 )
 
 type fixtureVersionRuntime struct {
+	rewriteTypes atomic.Bool
+	alterSource  atomic.Bool
 	failVerify   atomic.Bool
 	failPrevious atomic.Bool
 	running      atomic.Bool
@@ -47,12 +49,27 @@ func (v *fixtureVersionRuntime) Verify(ctx context.Context, p Project) error {
 	if v.failVerify.Load() {
 		return errors.New("fixture build failed")
 	}
+	if v.rewriteTypes.Load() {
+		if err := os.WriteFile(filepath.Join(p.WorkspacePath, "next-env.d.ts"), []byte(strings.ReplaceAll(fixtureNextDeclaration, ".next-dev", ".next")), 0640); err != nil {
+			return err
+		}
+	}
+	if v.alterSource.Load() {
+		if err := os.WriteFile(filepath.Join(p.WorkspacePath, "app/page.tsx"), []byte("unexpected runtime rewrite"), 0640); err != nil {
+			return err
+		}
+	}
 	v.running.Store(true)
 	return nil
 }
 func (v *fixtureVersionRuntime) StartPrevious(ctx context.Context, p Project) error {
 	if v.failPrevious.Load() {
 		return errors.New("fixture unavailable")
+	}
+	if v.rewriteTypes.Load() {
+		if err := os.WriteFile(filepath.Join(p.WorkspacePath, "next-env.d.ts"), []byte(fixtureNextDeclaration), 0640); err != nil {
+			return err
+		}
 	}
 	v.running.Store(true)
 	return nil
@@ -253,6 +270,35 @@ func TestVersionsAPIIntegration(t *testing.T) {
 		db.QueryRow(ctx, `SELECT current_version_id FROM projects WHERE id=$1`, p.ID).Scan(&id)
 		if id != current {
 			t.Fatal("failed restore updated current version")
+		}
+	})
+	t.Run("Next generated rewrites do not fail restore; real source changes roll back", func(t *testing.T) {
+		p := newProject()
+		writeFixtureSource(t, p, "next-env.d.ts", fixtureNextDeclaration)
+		old := save(p, "旧版")
+		writeFixtureSource(t, p, "app/page.tsx", "current page")
+		current := save(p, "当前版")
+		runtime.rewriteTypes.Store(true)
+		defer runtime.rewriteTypes.Store(false)
+		operation := submit(p, old, 2, newID())
+		wait(operation, "COMPLETED")
+		s.restoreWorkers.Wait()
+		raw, err := os.ReadFile(filepath.Join(p.WorkspacePath, "next-env.d.ts"))
+		if err != nil || string(raw) != fixtureNextDeclaration {
+			t.Fatal("generated declaration did not match historical snapshot")
+		}
+		runtime.alterSource.Store(true)
+		defer runtime.alterSource.Store(false)
+		operation = submit(p, current, 3, newID())
+		result := wait(operation, "FAILED")
+		s.restoreWorkers.Wait()
+		runtime.alterSource.Store(false)
+		if result.ErrorMessage == nil || !strings.Contains(*result.ErrorMessage, "校验值不一致") {
+			t.Fatalf("unexpected error: %+v", result)
+		}
+		var actual string
+		if err := db.QueryRow(ctx, `SELECT current_version_id FROM projects WHERE id=$1`, p.ID).Scan(&actual); err != nil || actual != old {
+			t.Fatal("real source mismatch switched current version")
 		}
 	})
 	t.Run("retention and current protection", func(t *testing.T) {

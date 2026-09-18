@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -257,7 +258,7 @@ func (s *projectService) executeRestore(ctx context.Context, p Project, id strin
 	if err = s.restorePhase(ctx, id, "VERIFYING"); err != nil {
 		return err
 	}
-	if err = runtime.Verify(ctx, p); err != nil {
+	if err = runPreservingNextDeclaration(p.WorkspacePath, func() error { return runtime.Verify(ctx, p) }); err != nil {
 		return err
 	}
 	current, err := sourceManifest(ctx, p.WorkspacePath)
@@ -265,6 +266,7 @@ func (s *projectService) executeRestore(ctx context.Context, p Project, id strin
 		return err
 	}
 	if current.Hash != hash {
+		logRestoreSourceMismatch(store, p.ID, versionID, hash, current)
 		return errRestoreSourceChanged
 	}
 	if err = s.restorePhase(ctx, id, "SESSION_HANDOFF"); err != nil {
@@ -294,7 +296,7 @@ func (s *projectService) executeRestore(ctx context.Context, p Project, id strin
 	if err = syncRestoreDirectories(parent, "versions", "versions/sessions"); err != nil {
 		return err
 	}
-	if err = runtime.StartPrevious(ctx, p); err != nil {
+	if err = runPreservingNextDeclaration(p.WorkspacePath, func() error { return runtime.StartPrevious(ctx, p) }); err != nil {
 		return err
 	}
 	current, err = sourceManifest(ctx, p.WorkspacePath)
@@ -302,6 +304,7 @@ func (s *projectService) executeRestore(ctx context.Context, p Project, id strin
 		return err
 	}
 	if current.Hash != hash {
+		logRestoreSourceMismatch(store, p.ID, versionID, hash, current)
 		return errRestoreSourceChanged
 	}
 	if err = s.restorePhase(ctx, id, "COMMITTING"); err != nil {
@@ -415,7 +418,7 @@ func (s *projectService) recoverRestore(ctx context.Context, p Project, id, mess
 			}
 		}
 		if op.PreviousRunning {
-			if e = runtime.StartPrevious(ctx, p); e != nil {
+			if e = runPreservingNextDeclaration(p.WorkspacePath, func() error { return runtime.StartPrevious(ctx, p) }); e != nil {
 				return e
 			}
 			if op.PreviousHash != nil {
@@ -483,4 +486,43 @@ func (s *projectService) recoverRestores(ctx context.Context) error {
 	}
 	s.collectVersions(ctx)
 	return nil
+}
+
+// Log paths only, never source contents, private configuration or credentials.
+func logRestoreSourceMismatch(store *os.Root, projectID, versionID, hash string, current versionManifest) {
+	expected, err := loadVersionManifest(store, versionID, hash)
+	if err != nil {
+		log.Printf("restore source mismatch project_id=%s version_id=%s", projectID, versionID)
+		return
+	}
+	files := map[string]versionEntry{}
+	for _, entry := range expected.Entries {
+		if !entry.IsDir {
+			files[entry.Path] = entry
+		}
+	}
+	var changed []string
+	for _, entry := range current.Entries {
+		if entry.IsDir {
+			continue
+		}
+		if previous, exists := files[entry.Path]; !exists || previous != entry {
+			changed = append(changed, entry.Path)
+		}
+		delete(files, entry.Path)
+	}
+	for name := range files {
+		changed = append(changed, name)
+	}
+	sort.Strings(changed)
+	count := len(changed)
+	if count > 20 {
+		changed = changed[:20]
+	}
+	for i, name := range changed {
+		if len(name) > 256 {
+			changed[i] = name[:256] + "…"
+		}
+	}
+	log.Printf("restore source mismatch project_id=%s version_id=%s changed_count=%d changed_files=%q", projectID, versionID, count, changed)
 }

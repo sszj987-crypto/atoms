@@ -19,6 +19,7 @@
 - Keep at most 10 versions with monotonic numbers; protect the current version. Restore creates no new version; subsequent successful work branches from the restored version.
 - Restore replaces actual source and rebuilds/checks Preview, not business data, current secrets or visible chat. Overwritten unversioned source does not become a history backup. Screenshots show only the saved homepage, never historical business data.
 - Durable restore operations share the project database lock/busy state with tasks, cancellation cleanup, deletion, download/export, restart/deploy, Preview startup and idle cleanup. Revision checks and idempotency prevent conflicting requests.
+- Restore verification/startup preserves canonical Next-generated `next-env.d.ts` bytes before full source hashing; custom declarations and all business/config source remain strictly checked. Homepage checks retry bounded transient startup failures.
 - Keep the complete previous workspace temporarily for failed/interrupted restore compensation. Startup compensates unfinished replacement before enabling writes; compensation failure leaves the project protected.
 - Product UI must not expose the internal Coding Agent implementation.
 - Point & Edit is a P0 feature.
