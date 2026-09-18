@@ -248,7 +248,7 @@ Generated App 默认限制：
                   │ Project Service  │
                   │ Codex Control    │
                   │ Runtime Manager  │
-                  │ Published Preview│
+                  │ Private Preview│
                   │ Cleanup Worker   │
                   └──────┬─────┬────┘
                          │     │
@@ -1266,17 +1266,22 @@ Codex 的主要工作应该集中在：
 
 # 29. Preview
 
-Platform 控制面暴露宿主机端口 `8080`。每个用户获得一个连续的宿主机端口段，每个项目从中获得一个稳定且唯一的端口；Runtime 的 `3000` 端口直接发布到该宿主机端口。
+Platform 控制面暴露宿主机端口 `8080`，鉴权预览代理使用 `PREVIEW_PORT_RANGE`。每个用户获得一个部署端口段，每个项目从中获得一个稳定且唯一的应用端口；只有显式部署后才发布 Runtime 的 `3000` 端口。
 
 ```text
 Platform:
 http://localhost:8080
 
-Project Preview / New Tab:
-http://localhost:<project_deploy_port>
+Project Preview / New Tab (authenticated):
+http://localhost:<preview_gateway_port>
+
+Deployed application:
+http://host:<project_deploy_port>
 ```
 
-工作区内嵌 Preview 和“新标签页打开”必须加载完全相同的宿主机 IP/域名与项目端口。工作区显示只读地址栏，不允许在其中修改 URL。
+工作区内嵌 Preview 和“新标签页打开”使用同一个平台鉴权代理地址，保留应用完整路由、API 与 WebSocket/HMR。默认代理端口为 PREVIEW_PORT_RANGE（8081–8100），每个活跃项目独占一个代理入口；该入口需要项目级签名凭证，匿名访问返回 401。地址栏只读并隐藏初始化凭证。
+
+开发时 Runtime 不发布项目的宿主机应用端口，点击部署后才发布长期分配的应用端口。部署状态持久化，重启、源码恢复与空闲后重建保留该状态。最小实现中预览和部署共用 Runtime 与源码，后续修改会影响已部署应用。升级后旧项目恢复为未部署并关闭旧端口，需要再次点击部署才开放。
 
 ---
 
@@ -1810,7 +1815,7 @@ project DB schema + role
 runtime container
 2 GiB / 2 CPU
 internal network
-published project preview
+authenticated private project preview
 24h cleanup
 runtime restore
 ```
@@ -1955,7 +1960,7 @@ project create
 runtime create
 runtime destroy
 idle cleanup
-published project preview
+authenticated private project preview
 cancel
 verification
 repair

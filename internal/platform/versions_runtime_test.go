@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -42,6 +43,7 @@ func TestVersionsRealRuntime(t *testing.T) {
 	}
 	key := bytes.Repeat([]byte{3}, 32)
 	cfg := Config{ProjectRoot: "/data/users", MasterKey: key, SessionKey: key, RuntimeImage: os.Getenv("ATOMS_VERSIONS_TEST_IMAGE"), RuntimeNetwork: network, DataVolumeName: volume, RuntimeCPU: 2, RuntimeMemoryBytes: 2 << 30, RuntimePIDs: 256, DeployPortBase: 19410, DeployPortSpan: 2, WebDir: "/test-web"}
+	cfg.PreviewPortRange = "19510-19511"
 	if cfg.RuntimeImage == "" {
 		t.Fatal("explicit test Runtime image is required")
 	}
@@ -77,6 +79,18 @@ func TestVersionsRealRuntime(t *testing.T) {
 	router := app.Router()
 	if err = s.ensureRuntime(ctx, p); err != nil {
 		t.Fatal(err)
+	}
+	if status, e := s.docker.inspect(ctx, runtimeName(p.ID)); e != nil || len(status.PublishedPorts) != 0 {
+		t.Fatalf("unpublished project exposes a host port: %+v %v", status, e)
+	}
+	for _, port := range app.PreviewPorts() {
+		listener, e := net.Listen("tcp", ":"+port)
+		if e != nil {
+			t.Fatal(e)
+		}
+		gateway := &http.Server{Handler: app.PreviewHandler(port), ReadHeaderTimeout: 10 * time.Second}
+		defer gateway.Close()
+		go gateway.Serve(listener)
 	}
 	if err = (projectVersionRuntime{s}).StartPrevious(ctx, p); err != nil {
 		t.Fatal(err)
@@ -219,6 +233,84 @@ func TestVersionsRealRuntime(t *testing.T) {
 	}
 	restore(initialID, initialHash, "ATOMS STARTER")
 	restore(latest, latestHash, "VERSION AFTER")
+	// The same project stays private through source restore. A failed explicit
+	// deployment must not persist publication or leave an exposed container.
+	s.cfg.RuntimeImage = "atoms-preview-fixture-image-does-not-exist:20260918"
+	if w := request("POST", "/deploy", nil); w.Code != 503 {
+		t.Fatalf("failed deployment: %d %s", w.Code, w.Body.String())
+	}
+	loaded, e := s.byID(ctx, owner.ID, p.ID)
+	if e != nil || loaded.Deployed {
+		t.Fatalf("failed deployment persisted: %+v %v", loaded, e)
+	}
+	if status, e := s.docker.inspect(ctx, runtimeName(p.ID)); e != nil || len(status.PublishedPorts) != 0 {
+		t.Fatalf("failed deployment exposed a port: %+v %v", status, e)
+	}
+	s.cfg.RuntimeImage = cfg.RuntimeImage
+	if err = s.ensureRuntime(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	access := request("GET", "/preview-access", nil)
+	if access.Code != 200 {
+		t.Fatalf("preview access: %d %s", access.Code, access.Body.String())
+	}
+	var entry struct {
+		URL string `json:"url"`
+	}
+	if err = json.Unmarshal(access.Body.Bytes(), &entry); err != nil {
+		t.Fatal(err)
+	}
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar, Timeout: 30 * time.Second}
+	response, e := client.Get(entry.URL)
+	if e != nil {
+		t.Fatal(e)
+	}
+	response.Body.Close()
+	if response.StatusCode != 200 {
+		t.Fatalf("authenticated preview: %d", response.StatusCode)
+	}
+	if strings.Contains(response.Request.URL.RawQuery, "preview_token") {
+		t.Fatal("bootstrap token leaked to app URL")
+	}
+	clean := *response.Request.URL
+	response, e = http.Get(clean.String())
+	if e != nil {
+		t.Fatal(e)
+	}
+	response.Body.Close()
+	if response.StatusCode != 401 {
+		t.Fatalf("anonymous preview: %d", response.StatusCode)
+	}
+	clean.Path = "/api/health"
+	response, e = client.Get(clean.String())
+	if e != nil {
+		t.Fatal(e)
+	}
+	response.Body.Close()
+	if response.StatusCode != 200 {
+		t.Fatalf("preview API route: %d", response.StatusCode)
+	}
+	if w := request("POST", "/deploy", nil); w.Code != 200 {
+		t.Fatalf("deployment: %d %s", w.Code, w.Body.String())
+	}
+	loaded, e = s.byID(ctx, owner.ID, p.ID)
+	if e != nil || !loaded.Deployed {
+		t.Fatalf("deployment not persisted: %+v %v", loaded, e)
+	}
+	if status, e := s.docker.inspect(ctx, runtimeName(p.ID)); e != nil || !runtimePublicationMatches(status, loaded) {
+		t.Fatalf("deployment missing assigned port: %+v %v", status, e)
+	}
+	if w := request("POST", "/runtime/restart", nil); w.Code != 200 {
+		t.Fatalf("restart: %d %s", w.Code, w.Body.String())
+	}
+	if err = waitRuntimeReady(ctx, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if status, e := s.docker.inspect(ctx, runtimeName(p.ID)); e != nil || !runtimePublicationMatches(status, loaded) {
+		t.Fatalf("restart lost deployment: %+v %v", status, e)
+	}
+	t.Log("private Runtime, failed deployment, authenticated proxy/API, anonymous denial, explicit publication and restart verified")
 	if os.Getenv("ATOMS_VERSIONS_BROWSER_FIXTURE") != "1" {
 		return
 	}

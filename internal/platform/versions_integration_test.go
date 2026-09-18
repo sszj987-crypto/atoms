@@ -196,7 +196,7 @@ func TestVersionsAPIIntegration(t *testing.T) {
 			t.Fatal("duplicate request was not idempotent")
 		}
 		assertError(request(p, "POST", "/restore", &owner, map[string]any{"version_id": latest, "expected_revision": 2, "request_id": nonce}), 409, "RESTORE_REQUEST_CONFLICT")
-		for _, endpoint := range []struct{ method, path, code string }{{"POST", "/messages", "AGENT_RUN_IN_PROGRESS"}, {"DELETE", "", "RUN_IN_PROGRESS"}, {"POST", "/runtime/restart", "RUN_IN_PROGRESS"}, {"POST", "/deploy", "RUN_IN_PROGRESS"}, {"GET", "/export", "RUN_IN_PROGRESS"}, {"GET", "/file/download?path=app/page.tsx", "RUN_IN_PROGRESS"}, {"GET", "/files", "PROJECT_RESTORING"}, {"GET", "/file?path=app/page.tsx", "PROJECT_RESTORING"}} {
+		for _, endpoint := range []struct{ method, path, code string }{{"POST", "/messages", "AGENT_RUN_IN_PROGRESS"}, {"DELETE", "", "RUN_IN_PROGRESS"}, {"POST", "/runtime/restart", "RUN_IN_PROGRESS"}, {"POST", "/deploy", "RUN_IN_PROGRESS"}, {"POST", "/undeploy", "RUN_IN_PROGRESS"}, {"GET", "/export", "RUN_IN_PROGRESS"}, {"GET", "/file/download?path=app/page.tsx", "RUN_IN_PROGRESS"}, {"GET", "/files", "PROJECT_RESTORING"}, {"GET", "/file?path=app/page.tsx", "PROJECT_RESTORING"}} {
 			assertError(request(p, endpoint.method, endpoint.path, &owner, map[string]string{"content": "new task"}), 409, endpoint.code)
 		}
 		close(runtime.release)

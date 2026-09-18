@@ -32,7 +32,8 @@
 - Platform database: PostgreSQL.
 - Platform services: `atoms-app` + `postgres`.
 - Platform control-plane port: `8080`.
-- Every project Runtime publishes its stable assigned host port.
+- Project Runtime keeps its assigned application port private until explicit deployment. `deployed` persists publication intent; Docker remains the source of Runtime status.
+- Authenticated platform preview proxies use `PREVIEW_PORT_RANGE` (default `8081-8100`), one origin per active project. Preview supports server IPs without wildcard DNS.
 - PostgreSQL is not exposed to the host by default.
 - Internal Docker network: `atoms-internal`.
 
@@ -56,7 +57,9 @@
 - The Projects page still uses plural project-oriented information architecture.
 - One project has at most one Runtime Container.
 - Project files are physically isolated by user and project.
-- The embedded Preview loads the same host/port endpoint as opening the project in a new browser tab; its displayed address is read-only.
+- The embedded Preview and new-tab action use the same authenticated proxy endpoint; its displayed address is read-only and hides the bootstrap credential.
+- Preview and deployment share one Runtime/source workspace. Development and source restore affect an already deployed app; publication stays enabled through restart/restore until project deletion.
+- On upgrade, legacy always-published previews become private until explicitly deployed again.
 
 Data layout:
 

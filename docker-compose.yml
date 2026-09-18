@@ -4,8 +4,10 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+      - "${PREVIEW_PORT_RANGE:-8081-8100}:${PREVIEW_PORT_RANGE:-8081-8100}"
     environment:
       APP_PORT: "8080"
+      PREVIEW_PORT_RANGE: ${PREVIEW_PORT_RANGE:-8081-8100}
       # Keyword/value DSN intentionally avoids URL-escaping user-provided passwords.
       DATABASE_URL: host=postgres port=5432 user=atoms password=${POSTGRES_PASSWORD} dbname=atoms sslmode=disable
       APP_MASTER_KEY: ${APP_MASTER_KEY}

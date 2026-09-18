@@ -18,5 +18,5 @@ FROM alpine:3.22
 COPY --from=go-build /atoms-app /usr/local/bin/atoms-app
 COPY --from=web-build /src/web/dist /app/web/dist
 WORKDIR /app
-EXPOSE 8080
+EXPOSE 8080 8081-8100
 ENTRYPOINT ["/usr/local/bin/atoms-app"]

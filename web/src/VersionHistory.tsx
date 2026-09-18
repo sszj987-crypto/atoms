@@ -155,7 +155,7 @@ export function VersionHistoryDrawer({ projectID, open, onClose, controller }: {
       const bounds = event.currentTarget.getBoundingClientRect();
       if (event.target === event.currentTarget && (event.clientX > bounds.right || event.clientX < bounds.left)) closeDrawer();
     }}>
-      <header className="version-drawer-header"><h2 id="version-history-title">历史记录</h2><button type="button" className="secondary" aria-label="关闭历史记录" onClick={closeDrawer} disabled={controller.submitting}>×</button></header>
+      <header className="version-drawer-header"><h2 id="version-history-title">版本历史记录</h2><button type="button" className="secondary" aria-label="关闭版本历史记录" onClick={closeDrawer} disabled={controller.submitting}>×</button></header>
       <div className="version-section-label">版本</div>
       <div className="version-list">
         {controller.error ? <div className="source-empty" role="alert"><p>{controller.error}</p><button type="button" onClick={controller.refresh}>重试</button></div>

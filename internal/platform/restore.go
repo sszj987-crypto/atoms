@@ -453,7 +453,7 @@ func (s *projectService) recoverRestore(ctx context.Context, p Project, id, mess
 }
 
 func (s *projectService) recoverRestores(ctx context.Context) error {
-	rows, err := s.db.Query(ctx, `SELECT r.id,p.id,p.workspace_path,p.codex_state_path,p.db_schema,p.db_username,p.db_password_ciphertext,COALESCE(p.deploy_port,0) FROM project_restores r JOIN projects p ON p.id=r.project_id WHERE r.status IN ('PENDING','RUNNING','RECOVERING','BLOCKED')`)
+	rows, err := s.db.Query(ctx, `SELECT r.id,p.id,p.workspace_path,p.codex_state_path,p.db_schema,p.db_username,p.db_password_ciphertext,COALESCE(p.deploy_port,0),p.deployed FROM project_restores r JOIN projects p ON p.id=r.project_id WHERE r.status IN ('PENDING','RUNNING','RECOVERING','BLOCKED')`)
 	if err != nil {
 		return err
 	}
@@ -464,7 +464,7 @@ func (s *projectService) recoverRestores(ctx context.Context) error {
 	var operations []pending
 	for rows.Next() {
 		var x pending
-		if err = rows.Scan(&x.id, &x.p.ID, &x.p.WorkspacePath, &x.p.CodexStatePath, &x.p.DBSchema, &x.p.DBUsername, &x.p.DBPasswordCiphertext, &x.p.DeployPort); err != nil {
+		if err = rows.Scan(&x.id, &x.p.ID, &x.p.WorkspacePath, &x.p.CodexStatePath, &x.p.DBSchema, &x.p.DBUsername, &x.p.DBPasswordCiphertext, &x.p.DeployPort, &x.p.Deployed); err != nil {
 			break
 		}
 		operations = append(operations, x)

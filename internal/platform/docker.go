@@ -19,8 +19,9 @@ import (
 
 type dockerClient struct{ client *http.Client }
 type dockerContainer struct {
-	Exists  bool
-	Running bool
+	Exists         bool
+	Running        bool
+	PublishedPorts []string
 }
 
 func newDockerClient() *dockerClient {
@@ -65,11 +66,20 @@ func (d *dockerClient) inspect(ctx context.Context, name string) (dockerContaine
 		State struct {
 			Running bool `json:"Running"`
 		} `json:"State"`
+		HostConfig struct {
+			PortBindings map[string][]struct{ HostPort string } `json:"PortBindings"`
+		} `json:"HostConfig"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&raw); err != nil {
 		return dockerContainer{}, err
 	}
-	return dockerContainer{Exists: true, Running: raw.State.Running}, nil
+	container := dockerContainer{Exists: true, Running: raw.State.Running}
+	for _, bindings := range raw.HostConfig.PortBindings {
+		for _, binding := range bindings {
+			container.PublishedPorts = append(container.PublishedPorts, binding.HostPort)
+		}
+	}
+	return container, nil
 }
 func (d *dockerClient) ping(ctx context.Context) error {
 	res, err := d.request(ctx, http.MethodGet, "/_ping", nil)
@@ -107,6 +117,10 @@ func (d *dockerClient) managedProjectIDs(ctx context.Context) ([]string, error) 
 }
 func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseURL, image, dataVolume, network, deployPort string, cpu, memory, pids int64) error {
 	name := runtimeName(p.ID)
+	bindings := map[string]any{}
+	if p.Deployed {
+		bindings["3000/tcp"] = []map[string]string{{"HostIp": "0.0.0.0", "HostPort": deployPort}}
+	}
 	body := map[string]any{
 		"Image": image, "WorkingDir": "/workspace",
 		"ExposedPorts": map[string]any{"3000/tcp": map[string]any{}},
@@ -120,14 +134,14 @@ func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseUR
 			"Memory":       memory,
 			"PidsLimit":    pids,
 			"NetworkMode":  network,
-			"PortBindings": map[string]any{"3000/tcp": []map[string]string{{"HostPort": deployPort}}},
+			"PortBindings": bindings,
 			"Mounts": []map[string]any{
 				{"Type": "volume", "Source": dataVolume, "Target": "/workspace", "VolumeOptions": map[string]any{"Subpath": volumeSubpath(p.WorkspacePath)}},
 				{"Type": "volume", "Source": dataVolume, "Target": "/codex", "VolumeOptions": map[string]any{"Subpath": volumeSubpath(p.CodexStatePath)}},
 			},
 		},
 	}
-	log.Printf("docker createAndStart create project=%s deployPort=%q portBindings=%v", p.ID, deployPort, map[string]any{"3000/tcp": []map[string]string{{"HostPort": deployPort}}})
+	log.Printf("docker createAndStart create project=%s deployed=%v portBindings=%v", p.ID, p.Deployed, bindings)
 	res, err := d.request(ctx, http.MethodPost, "/containers/create?name="+url.QueryEscape(name), body)
 	if err != nil {
 		return err

@@ -11,7 +11,7 @@ import "./phase3.css";
 
 type User = { id: string; email: string };
 type Config = { configured?: boolean; base_url?: string; api_key_set?: boolean; model?: string };
-type Project = { id: string; name: string; last_accessed_at: string };
+type Project = { id: string; name: string; last_accessed_at: string; deployed?: boolean; deploy_port?: number };
 type RunProgress = { id: number; step_id?: string; kind: string; title: string; detail?: string; status?: string; created_at?: string };
 type Run = { id: string; status: string; error_message?: string };
 type Page = "home" | "projects" | "project" | "settings" | "auth";
@@ -96,6 +96,7 @@ const errorText = (e: unknown) => {
     SOURCE_EXPORT_FAILED: "源码下载或导出失败，请重试",
     SOURCE_LIMIT_EXCEEDED: "超过文件区限制：文件列表最多 20,000 项，导出最多 10,000 个文件 / 100 MiB，单文件下载最多 100 MiB",
     RUN_READ_FAILED: "无法确认任务状态，请重试",
+    PREVIEW_CAPACITY_REACHED: "预览入口已占满，请稍后重试",
   };
   return zh[m] || m.replaceAll("_", " ");
 };
@@ -217,16 +218,18 @@ function Home({ setPage, user, projects, onCreated, onLogin }: { setPage: Naviga
   );
 }
 
-function ProjectCard({ project, setPage, onDeleted, onRenamed }: { project: Project; setPage: Navigate; onDeleted: (id: string) => void; onRenamed: (p: Project) => void }) {
-  const [deployUrl, setDeployUrl] = useState("");
+function ProjectCard({ project, setPage, onDeleted, onUpdated }: { project: Project; setPage: Navigate; onDeleted: (id: string) => void; onUpdated: (p: Project) => void }) {
+  const deployUrl = project.deployed && project.deploy_port ? `http://${location.hostname}:${project.deploy_port}` : "";
   const [deploying, setDeploying] = useState(false);
   const [error, setError] = useState("");
   const [editingName, setEditingName] = useState(false);
   const [name, setName] = useState(project.name);
   useEffect(() => { if (!editingName) setName(project.name); }, [project.id, project.name, editingName]);
   async function doDeploy() {
-    setDeploying(true); setError(""); setDeployUrl("");
-    try { const r = await api<{ port: string }>(`/project/${project.id}/deploy`, { method: "POST" }); setDeployUrl(`http://${location.hostname}:${r.port}`); }
+    if (deploying) return;
+    setDeploying(true); setError("");
+    const deployed = !project.deployed;
+    try { const r = await api<{ port: string }>(`/project/${project.id}/${deployed ? "deploy" : "undeploy"}`, { method: "POST" }, 150_000); onUpdated({ ...project, deployed, deploy_port: Number(r.port) }); }
     catch (e) { setError(errorText(e)); }
     finally { setDeploying(false); }
   }
@@ -241,7 +244,7 @@ function ProjectCard({ project, setPage, onDeleted, onRenamed }: { project: Proj
     setError("");
     try {
       const r = await api<{ project: Project }>(`/project/${project.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
-      onRenamed(r.project); setEditingName(false);
+      onUpdated(r.project); setEditingName(false);
     } catch (e) { setError(errorText(e)); }
   }
   return (
@@ -252,25 +255,25 @@ function ProjectCard({ project, setPage, onDeleted, onRenamed }: { project: Proj
           ? <form className="rename-form" onSubmit={rename}><input aria-label="项目名称" autoFocus maxLength={16} value={name} onChange={e => setName(e.target.value)} /><button>保存</button><button type="button" className="secondary" onClick={() => { setName(project.name); setEditingName(false); }}>取消</button></form>
           : <h2 className="editable-title" role="button" tabIndex={0} title="点击修改项目名称" onClick={() => setEditingName(true)} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setEditingName(true); } }}>{project.name}</h2>}
         </div>
-        <div className="card-actions"><button onClick={() => setPage("project", project.id)}>打开项目</button><button className="secondary" onClick={doDeploy}>部署</button><button className="danger" onClick={doDelete}>删除</button></div>
+        <div className="card-actions"><button onClick={() => setPage("project", project.id)}>打开项目</button><button className="secondary" onClick={doDeploy} disabled={deploying}>{project.deployed ? "取消发布" : "发布"}</button><button className="danger" onClick={doDelete}>删除</button></div>
       </div>
       <div className="project-card-copy">
         <p>点击项目名称可修改，打开后继续通过对话构建。</p>
-        {deploying && <p className="muted status-message" role="status">正在部署…</p>}
-        {deployUrl && <p className="success status-message" role="status">已部署：<a href={deployUrl} target="_blank" rel="noreferrer">{deployUrl}</a></p>}
+        {deploying && <p className="muted status-message" role="status">{project.deployed ? "正在取消发布…" : "正在发布…"}</p>}
+        {deployUrl && <p className="success status-message" role="status">已发布：<a href={deployUrl} target="_blank" rel="noreferrer">{deployUrl}</a></p>}
         {error && <p className="error status-message" role="alert">{error}</p>}
       </div>
     </div>
   );
 }
 
-function Projects({ setPage, projects, onDeleted, onRenamed }: { setPage: Navigate; projects: Project[]; onDeleted: (id: string) => void; onRenamed: (p: Project) => void }) {
+function Projects({ setPage, projects, onDeleted, onUpdated }: { setPage: Navigate; projects: Project[]; onDeleted: (id: string) => void; onUpdated: (p: Project) => void }) {
   return (
     <section className="page">
       <p className="eyebrow">工作区</p>
       <h1>项目</h1>
       {projects.length
-        ? projects.map(p => <ProjectCard key={p.id} project={p} setPage={setPage} onDeleted={onDeleted} onRenamed={onRenamed} />)
+        ? projects.map(p => <ProjectCard key={p.id} project={p} setPage={setPage} onDeleted={onDeleted} onUpdated={onUpdated} />)
         : <div className="empty"><span className="empty-icon" aria-hidden="true">＋</span><h2>创建你的第一个项目</h2><p>描述一个想法，平台会准备运行环境并生成可预览的应用。</p><button onClick={() => setPage("home")}>开始创建</button></div>}
     </section>
   );
@@ -330,16 +333,27 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
     if (restoring) { setPreviewURL(""); return; }
     setPreviewURL("");
     setPreviewError("");
-    api<{ port: number }>(`/project/${project.id}/preview-access`, undefined, 120_000).then(r => {
-      if (active && Number.isInteger(r.port) && r.port > 0) setPreviewURL(`${location.protocol}//${location.hostname}:${r.port}`);
-    }).catch(() => {
+    api<{ url: string }>(`/project/${project.id}/preview-access`, undefined, 150_000).then(r => {
+      if (active) setPreviewURL(r.url);
+    }).catch(e => {
       if (active) {
-        setPreviewError("项目运行环境启动失败，请重试");
+        setPreviewError(errorText(e));
         setStatus("预览地址不可用");
       }
     });
     return () => { active = false; };
   }, [project.id, reload, restoring, versionHistory.known]);
+  useEffect(() => {
+    if (!previewURL) return;
+    let active = true;
+    // Keep an open workspace's proxy slot alive without reloading its iframe.
+    const timer = window.setInterval(() => {
+      api<{ url: string }>(`/project/${project.id}/preview-access`, undefined, 150_000).then(r => {
+        if (active && r.url.split("?")[0] !== previewURL.split("?")[0]) setPreviewURL(r.url);
+      }).catch(() => {});
+    }, 10 * 60_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [project.id, previewURL]);
   useEffect(() => {
     let current = true;
     load().catch(e => setChatError(errorText(e)));
@@ -354,7 +368,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
     }).catch(e => {
       if (current) setChatError(errorText(e));
     });
-    api<{ exists: boolean; running: boolean }>(`/project/${project.id}/runtime/status`).then(s => setStatus(s.running ? "运行时运行中" : "运行时启动中")).catch(() => setStatus("运行时不可用"));
+    api<{ exists: boolean; running: boolean }>(`/project/${project.id}/runtime/status`).then(s => { if (current) setStatus(s.running ? "运行中" : "启动中"); }).catch(() => { if (current) setStatus("运行时不可用"); });
     return () => { current = false; };
   }, [project.id]);
   useEffect(() => {
@@ -428,13 +442,16 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
       if (!result.runtime_reset) setChatError("任务正在清理，项目暂不可修改；若持续失败，请检查运行环境后重启服务。");
     } catch (e) { setChatError(errorText(e)); }
   }
-  const previewAddress = previewURL || "正在准备项目地址…";
+  const previewAddress = previewURL ? previewURL.split("?")[0] : "正在准备项目地址…";
   const runtimeIssue = status.includes("不可用") || status === "FAILED";
+  const workspaceStatus = !run && !runtimeIssue
+    ? project.deployed ? "已发布" : ["COMPLETED", "CANCELLED"].includes(status) ? "运行中" : statusText(status)
+    : statusText(status);
   return (
     <section className="workspace">
       <WorkspaceHeader name={project.name} version={currentVersionNumber(versionHistory.history)} onBack={onBack}
         issue={runtimeIssue || versionHistory.history?.restore?.status === "BLOCKED"}
-        status={restoring ? versionHistory.history?.restore?.status === "BLOCKED" ? "项目已保护" : "版本恢复中" : statusText(status)} />
+        status={restoring ? versionHistory.history?.restore?.status === "BLOCKED" ? "项目已保护" : "版本恢复中" : workspaceStatus} />
       <VersionRestoreNotice controller={versionHistory} />
       <div className="workspace-tabs" role="tablist" aria-label="工作区面板"><button role="tab" aria-selected={mobilePane === "chat"} className={mobilePane === "chat" ? "active" : ""} onClick={() => setMobilePane("chat")}>对话</button><button role="tab" aria-selected={mobilePane === "preview"} className={mobilePane === "preview" ? "active" : ""} onClick={() => setMobilePane("preview")}>预览</button></div>
       <div className="workspace-body">
@@ -443,7 +460,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
             <div><span className="panel-kicker">对话{messages.length > 0 && ` · ${messages.length} 条消息`}</span><h2>构建记录</h2></div>
             <button type="button" className="secondary version-history-button" aria-haspopup="dialog" onClick={() => setHistoryOpen(true)}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 11a9 9 0 1 1 2.6 7.4M3 4v7h7M12 7v5l3 2" /></svg>
-              历史记录
+              版本历史记录
             </button>
           </div>
           <div className="history">{messages.length ? messages.map(m => <div key={m.id} className={`message ${m.role}`}><span>{m.role === "user" ? "你" : "Atoms"}</span><p>{m.content}</p></div>) : <div className="chat-empty"><span aria-hidden="true">✦</span><h3>从描述需求开始</h3><p>告诉我你想构建或修改什么，执行过程会实时显示在这里。</p></div>}</div>
@@ -573,7 +590,7 @@ function App() {
       <main>
         {!authReady ? <section className="page"><p className="muted">正在加载…</p></section> : <>
           {page === "home" && <Home setPage={navigate} user={user} projects={projects} onCreated={(p, initialDraft) => { setProjects(prev => [...prev, p]); setWorkspaceDraft(initialDraft); }} onLogin={askLogin} />}
-          {page === "projects" && (user ? <Projects setPage={navigate} projects={projects} onDeleted={(id) => setProjects(prev => prev.filter(p => p.id !== id))} onRenamed={(p) => setProjects(prev => prev.map(x => x.id === p.id ? p : x))} /> : <LoginPrompt onLogin={askLogin} />)}
+          {page === "projects" && (user ? <Projects setPage={navigate} projects={projects} onDeleted={(id) => setProjects(prev => prev.filter(p => p.id !== id))} onUpdated={(p) => setProjects(prev => prev.map(x => x.id === p.id ? p : x))} /> : <LoginPrompt onLogin={askLogin} />)}
           {page === "settings" && (user ? <Settings /> : <LoginPrompt onLogin={askLogin} />)}
           {page === "project" && (user ? (projectReady ? (currentProject ? <ProjectWorkspace key={currentProject.id} project={currentProject} initialDraft={workspaceDraft} onDraftConsumed={() => setWorkspaceDraft("")} onBack={() => navigate("projects")} /> : <LoginPrompt onLogin={askLogin} />) : <section className="page"><p className="muted">正在加载项目…</p></section>) : <LoginPrompt onLogin={askLogin} />)}
           {page === "auth" && <Auth onUser={login} />}

@@ -81,6 +81,7 @@ func (s *authService) login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, u)
 }
 func (s *authService) logout(w http.ResponseWriter, r *http.Request) {
+	s.clearPreviewCookies(w, r)
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: secureRequest(r), MaxAge: -1})
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -114,7 +115,15 @@ func contextWithUser(r *http.Request, u User) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), currentUserKey{}, u))
 }
 func (s *authService) setSession(w http.ResponseWriter, r *http.Request, userID string) {
+	s.clearPreviewCookies(w, r)
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: s.signSession(userID), Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: secureRequest(r), MaxAge: int((7 * 24 * time.Hour).Seconds())})
+}
+func (s *authService) clearPreviewCookies(w http.ResponseWriter, r *http.Request) {
+	for _, cookie := range r.Cookies() {
+		if strings.HasPrefix(cookie.Name, previewCookie) {
+			http.SetCookie(w, &http.Cookie{Name: cookie.Name, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: secureRequest(r), MaxAge: -1})
+		}
+	}
 }
 func (s *authService) signSession(id string) string {
 	payload, _ := json.Marshal(struct {
@@ -148,11 +157,17 @@ func (s *authService) readSession(v string) (string, bool) {
 	return p.ID, true
 }
 func (s *authService) signPreview(userID, projectID string) string {
+	return s.signPreviewFor(userID, projectID, 10*time.Minute)
+}
+func (s *authService) signPreviewSession(userID, projectID string) string {
+	return s.signPreviewFor(userID, projectID, 7*24*time.Hour)
+}
+func (s *authService) signPreviewFor(userID, projectID string, ttl time.Duration) string {
 	payload, _ := json.Marshal(struct {
 		UserID    string `json:"uid"`
 		ProjectID string `json:"pid"`
 		Exp       int64  `json:"exp"`
-	}{userID, projectID, time.Now().Add(10 * time.Minute).Unix()})
+	}{userID, projectID, time.Now().Add(ttl).Unix()})
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
 	mac := hmac.New(sha256.New, s.sessionKey)
 	mac.Write([]byte("preview." + encoded))
@@ -181,14 +196,17 @@ func (s *authService) readPreview(v string) (string, string, bool) {
 	return payload.UserID, payload.ProjectID, true
 }
 func (s *authService) setPreviewCookie(w http.ResponseWriter, r *http.Request, token string) {
+	s.setPreviewCookieNamed(w, r, previewCookie, token)
+}
+func (s *authService) setPreviewCookieNamed(w http.ResponseWriter, r *http.Request, cookieName, token string) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     previewCookie,
+		Name:     cookieName,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		Secure:   secureRequest(r),
-		MaxAge:   int((10 * time.Minute).Seconds()),
+		MaxAge:   int((7 * 24 * time.Hour).Seconds()),
 	})
 }
 func secureRequest(r *http.Request) bool {

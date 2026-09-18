@@ -73,7 +73,7 @@ func TestSourceBrowserFixture(t *testing.T) {
 			auth.requireUser(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case base + "/preview-access":
-					writeJSON(w, 200, map[string]int{"port": 19082})
+					writeJSON(w, 200, map[string]string{"url": "http://files-fixture.localhost:19082"})
 				case base + "/runtime/status":
 					writeJSON(w, 200, map[string]bool{"exists": true, "running": true})
 				case "/__fixture/stop":

@@ -36,7 +36,8 @@ type Project struct {
 	DBUsername           string    `json:"-"`
 	DBPasswordCiphertext []byte    `json:"-"`
 	LastAccessedAt       time.Time `json:"last_accessed_at"`
-	DeployPort           int       `json:"-"`
+	DeployPort           int       `json:"deploy_port"`
+	Deployed             bool      `json:"deployed"`
 }
 type projectService struct {
 	db             *pgxpool.Pool
@@ -254,6 +255,15 @@ func (s *projectService) restart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "starting"})
 }
 func (s *projectService) deploy(w http.ResponseWriter, r *http.Request) {
+	s.setPublication(w, r, true)
+}
+func (s *projectService) undeploy(w http.ResponseWriter, r *http.Request) {
+	s.setPublication(w, r, false)
+}
+func (s *projectService) setPublication(w http.ResponseWriter, r *http.Request, deployed bool) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	r = r.WithContext(ctx)
 	p, err := s.byID(r.Context(), r.Context().Value(currentUserKey{}).(User).ID, chi.URLParam(r, "id"))
 	if errors.Is(err, pgx.ErrNoRows) {
 		apiError(w, 404, "PROJECT_NOT_FOUND")
@@ -268,11 +278,33 @@ func (s *projectService) deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
-	if err := s.recreateRuntime(r.Context(), p); err != nil {
+	// Refresh under the project lock: another publication change may have completed
+	// while this request was waiting for the lock.
+	if err = tx.QueryRow(ctx, `SELECT deployed FROM projects WHERE id=$1`, p.ID).Scan(&p.Deployed); err != nil {
+		apiError(w, 500, "PROJECT_READ_FAILED")
+		return
+	}
+	previous := p
+	committed := false
+	defer func() {
+		if !committed {
+			cleanupCtx, done := context.WithTimeout(context.Background(), 15*time.Second)
+			defer done()
+			if err := s.recreateRuntimeWithPublication(cleanupCtx, previous); err != nil {
+				log.Printf("publication rollback runtime failed project=%s err=%v", p.ID, err)
+			}
+		}
+	}()
+	p.Deployed = deployed
+	if err := s.recreateRuntimeWithPublication(r.Context(), p); err != nil {
 		apiError(w, 503, "RUNTIME_UNAVAILABLE")
 		return
 	}
-	if _, err = tx.Exec(r.Context(), `UPDATE projects SET last_accessed_at=now() WHERE id=$1`, p.ID); err != nil {
+	if err = waitRuntimeReady(ctx, p.ID); err != nil {
+		apiError(w, 503, "RUNTIME_UNAVAILABLE")
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `UPDATE projects SET deployed=$2,last_accessed_at=now() WHERE id=$1`, p.ID, deployed); err != nil {
 		apiError(w, 500, "PROJECT_READ_FAILED")
 		return
 	}
@@ -280,7 +312,8 @@ func (s *projectService) deploy(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 500, "PROJECT_READ_FAILED")
 		return
 	}
-	writeJSON(w, 200, map[string]string{"port": strconv.Itoa(p.DeployPort)})
+	committed = true
+	writeJSON(w, 200, map[string]any{"port": strconv.Itoa(p.DeployPort), "deployed": deployed})
 }
 
 const maxProjectsPerUser = 2
@@ -411,7 +444,7 @@ func availableProjectPort(base, span int, used []int) (int, bool) {
 	return 0, false
 }
 func (s *projectService) list(ctx context.Context, userID string) ([]Project, error) {
-	rows, err := s.db.Query(ctx, `SELECT p.id,p.name,p.workspace_path,p.codex_state_path,p.db_schema,p.db_username,p.db_password_ciphertext,p.last_accessed_at,COALESCE(p.deploy_port,u.deploy_port,0) FROM projects p JOIN users u ON u.id=p.user_id WHERE p.user_id=$1 ORDER BY p.created_at`, userID)
+	rows, err := s.db.Query(ctx, `SELECT p.id,p.name,p.workspace_path,p.codex_state_path,p.db_schema,p.db_username,p.db_password_ciphertext,p.last_accessed_at,COALESCE(p.deploy_port,u.deploy_port,0),p.deployed FROM projects p JOIN users u ON u.id=p.user_id WHERE p.user_id=$1 ORDER BY p.created_at`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -419,7 +452,7 @@ func (s *projectService) list(ctx context.Context, userID string) ([]Project, er
 	out := []Project{}
 	for rows.Next() {
 		var p Project
-		if err := rows.Scan(&p.ID, &p.Name, &p.WorkspacePath, &p.CodexStatePath, &p.DBSchema, &p.DBUsername, &p.DBPasswordCiphertext, &p.LastAccessedAt, &p.DeployPort); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.WorkspacePath, &p.CodexStatePath, &p.DBSchema, &p.DBUsername, &p.DBPasswordCiphertext, &p.LastAccessedAt, &p.DeployPort, &p.Deployed); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -428,7 +461,7 @@ func (s *projectService) list(ctx context.Context, userID string) ([]Project, er
 }
 func (s *projectService) byID(ctx context.Context, userID, projectID string) (Project, error) {
 	var p Project
-	err := s.db.QueryRow(ctx, `SELECT p.id,p.name,p.workspace_path,p.codex_state_path,p.db_schema,p.db_username,p.db_password_ciphertext,p.last_accessed_at,COALESCE(p.deploy_port,u.deploy_port,0) FROM projects p JOIN users u ON u.id=p.user_id WHERE p.id=$1 AND p.user_id=$2`, projectID, userID).Scan(&p.ID, &p.Name, &p.WorkspacePath, &p.CodexStatePath, &p.DBSchema, &p.DBUsername, &p.DBPasswordCiphertext, &p.LastAccessedAt, &p.DeployPort)
+	err := s.db.QueryRow(ctx, `SELECT p.id,p.name,p.workspace_path,p.codex_state_path,p.db_schema,p.db_username,p.db_password_ciphertext,p.last_accessed_at,COALESCE(p.deploy_port,u.deploy_port,0),p.deployed FROM projects p JOIN users u ON u.id=p.user_id WHERE p.id=$1 AND p.user_id=$2`, projectID, userID).Scan(&p.ID, &p.Name, &p.WorkspacePath, &p.CodexStatePath, &p.DBSchema, &p.DBUsername, &p.DBPasswordCiphertext, &p.LastAccessedAt, &p.DeployPort, &p.Deployed)
 	return p, err
 }
 func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
@@ -441,7 +474,7 @@ func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
 		return err
 	}
 	var exists, busy bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1), (`+restoreBusySQL+` OR EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status='CANCELLING'))`, p.ID).Scan(&exists, &busy); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1), (`+restoreBusySQL+` OR EXISTS(SELECT 1 FROM agent_runs WHERE project_id=$1 AND status='CANCELLING')), COALESCE((SELECT deployed FROM projects WHERE id=$1),false)`, p.ID).Scan(&exists, &busy, &p.Deployed); err != nil {
 		return err
 	}
 	if !exists {
@@ -467,7 +500,7 @@ func (s *projectService) ensureRuntimeLocked(ctx context.Context, p Project) err
 		log.Printf("ensureRuntime inspect failed project=%s err=%v", p.ID, err)
 		return err
 	}
-	if status.Running {
+	if status.Running && runtimePublicationMatches(status, p) {
 		return nil
 	}
 	if status.Exists {
@@ -488,7 +521,19 @@ func (s *projectService) ensureRuntimeLocked(ctx context.Context, p Project) err
 	}
 	return nil
 }
+func runtimePublicationMatches(status dockerContainer, p Project) bool {
+	if !p.Deployed {
+		return len(status.PublishedPorts) == 0
+	}
+	return len(status.PublishedPorts) == 1 && status.PublishedPorts[0] == strconv.Itoa(p.DeployPort)
+}
 func (s *projectService) recreateRuntime(ctx context.Context, p Project) error {
+	if err := s.db.QueryRow(ctx, `SELECT deployed FROM projects WHERE id=$1`, p.ID).Scan(&p.Deployed); err != nil {
+		return err
+	}
+	return s.recreateRuntimeWithPublication(ctx, p)
+}
+func (s *projectService) recreateRuntimeWithPublication(ctx context.Context, p Project) error {
 	lock := s.runtimeLock(p.ID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -615,6 +660,23 @@ func (s *projectService) recover(ctx context.Context) error {
 			return err
 		}
 		if !exists {
+			if err := s.removeRuntime(ctx, id); err != nil {
+				return err
+			}
+			continue
+		}
+		var p Project
+		p.ID = id
+		if err := s.db.QueryRow(ctx, `SELECT deployed,COALESCE(deploy_port,0) FROM projects WHERE id=$1`, id).Scan(&p.Deployed, &p.DeployPort); err != nil {
+			return err
+		}
+		status, err := s.docker.inspect(ctx, runtimeName(id))
+		if err != nil {
+			return err
+		}
+		// Close legacy preview ports on upgrade and compensate a deployment
+		// interrupted before its database transaction committed. Restart lazily.
+		if !runtimePublicationMatches(status, p) {
 			if err := s.removeRuntime(ctx, id); err != nil {
 				return err
 			}

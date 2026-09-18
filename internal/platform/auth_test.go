@@ -1,9 +1,29 @@
 package platform
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"testing"
 )
+
+func TestLogoutClearsProjectPreviewCookies(t *testing.T) {
+	service := &authService{}
+	r := httptest.NewRequest("POST", "http://localhost:8080/api/auth/logout", nil)
+	r.AddCookie(&http.Cookie{Name: previewCookie + "_8081", Value: "first"})
+	r.AddCookie(&http.Cookie{Name: previewCookie + "_8082", Value: "second"})
+	r.AddCookie(&http.Cookie{Name: "app_session", Value: "business"})
+	w := httptest.NewRecorder()
+	service.logout(w, r)
+	cookies := w.Result().Cookies()
+	if len(cookies) != 3 {
+		t.Fatalf("logout cookies: %#v", cookies)
+	}
+	for _, c := range cookies {
+		if c.MaxAge != -1 || c.Value != "" || c.Name == "app_session" {
+			t.Fatalf("invalid cleared cookie: %#v", c)
+		}
+	}
+}
 
 func TestSessionCookieUsesRequestHost(t *testing.T) {
 	service := &authService{sessionKey: []byte("01234567890123456789012345678901")}
