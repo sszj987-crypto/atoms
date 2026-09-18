@@ -63,7 +63,7 @@ func TestPreviewGatewayBrowserFixture(t *testing.T) {
 			if published {
 				bindings["3000/tcp"] = []map[string]string{{"HostPort": "19410"}}
 			}
-			writeJSON(w, 200, map[string]any{"State": map[string]bool{"Running": running}, "HostConfig": map[string]any{"PortBindings": bindings}})
+			writeJSON(w, 200, map[string]any{"State": map[string]bool{"Running": running}, "HostConfig": map[string]any{"PortBindings": bindings}, "Config": map[string]any{"Env": []string{"ATOMS_PREVIEW_BASE_PATH=" + previewPath(key, id)}}})
 		case r.Method == "DELETE":
 			running = false
 			published = false
@@ -92,7 +92,7 @@ func TestPreviewGatewayBrowserFixture(t *testing.T) {
 		}
 	}))
 	defer mock.Close()
-	cfg := Config{MasterKey: key, PreviewPortRange: "19510-19511", WebDir: "/test-web", RuntimeImage: "fixture", RuntimeNetwork: "fixture", DataVolumeName: "fixture"}
+	cfg := Config{MasterKey: key, WebDir: "/test-web", RuntimeImage: "fixture", RuntimeNetwork: "fixture", DataVolumeName: "fixture"}
 	s := newProjectService(db, cfg, nil)
 	defer s.shutdownRestores(ctx)
 	s.docker = &dockerClient{client: &http.Client{Transport: rewriteDockerTransport{base: mock.URL}}}
@@ -115,19 +115,13 @@ func TestPreviewGatewayBrowserFixture(t *testing.T) {
 		}
 		router.ServeHTTP(w, r)
 	})
-	for _, port := range append([]string{"19091"}, app.PreviewPorts()...) {
-		var handler http.Handler = app.PreviewHandler(port)
-		if port == "19091" {
-			handler = platformHandler
-		}
-		listener, e := net.Listen("tcp", ":"+port)
-		if e != nil {
-			t.Fatal(e)
-		}
-		server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
-		defer server.Close()
-		go server.Serve(listener)
+	listener, e := net.Listen("tcp", ":19091")
+	if e != nil {
+		t.Fatal(e)
 	}
+	server := &http.Server{Handler: platformHandler, ReadHeaderTimeout: 10 * time.Second}
+	defer server.Close()
+	go server.Serve(listener)
 	if err = waitRuntimeReady(ctx, id); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +134,7 @@ func TestPreviewGatewayBrowserFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	jar, _ := cookiejar.New(nil)
-	client := &http.Client{Jar: jar, Timeout: 30 * time.Second}
+	client := &http.Client{Jar: jar, Timeout: 30 * time.Second, Transport: previewFixtureTransport{projectID: id}}
 	response, err := client.Get(entry.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -159,10 +153,10 @@ func TestPreviewGatewayBrowserFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if response.StatusCode != 401 {
-		t.Fatalf("anonymous preview: %d", response.StatusCode)
+	if response.StatusCode != 403 {
+		t.Fatalf("standalone preview: %d", response.StatusCode)
 	}
-	clean.Path = "/api/health"
+	clean.Path = strings.TrimSuffix(clean.Path, "/") + "/api/health"
 	response, err = client.Get(clean.String())
 	if err != nil {
 		t.Fatal(err)

@@ -128,50 +128,65 @@ func hsts(next http.Handler) http.Handler {
 func (a *App) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, hsts, middleware.Recoverer)
+	r.Handle(previewNamespace+"*", http.HandlerFunc(a.servePreview))
 	r.Mount("/", a.platformHandler())
 	return r
 }
 
-func (a *App) servePreview(w http.ResponseWriter, r *http.Request, projectID, cookieName string) {
-	r = r.WithContext(context.WithValue(r.Context(), previewProjectKey{}, projectID))
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Referrer-Policy", "same-origin")
-	if !sameOriginRequest(r) {
-		apiError(w, http.StatusForbidden, "PREVIEW_ORIGIN_DENIED")
+func (a *App) servePreview(w http.ResponseWriter, r *http.Request) {
+	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, previewNamespace), "/", 3)
+	if len(parts) < 2 || !validID(parts[0]) {
+		apiError(w, 404, "PROJECT_NOT_FOUND")
 		return
 	}
-
-	token := r.URL.Query().Get("preview_token")
-	fromQuery := token != ""
-	if !fromQuery {
-		if cookie, err := r.Cookie(cookieName); err == nil {
-			token = cookie.Value
-		}
+	projectID := parts[0]
+	prefix := previewPath(a.cfg.MasterKey, projectID)
+	if r.URL.Path != prefix && !strings.HasPrefix(r.URL.Path, prefix+"/") {
+		apiError(w, 401, "AUTH_REQUIRED")
+		return
 	}
-	if userID, tokenProjectID, ok := a.auth.readPreview(token); ok && tokenProjectID == projectID {
-		var u User
-		if err := a.db.QueryRow(r.Context(), `SELECT id,email FROM users WHERE id=$1`, userID).Scan(&u.ID, &u.Email); err == nil {
-			if fromQuery {
-				if r.Method != http.MethodGet {
-					apiError(w, http.StatusBadRequest, "INVALID_PREVIEW_REQUEST")
-					return
-				}
-				if _, err := a.projects.byID(r.Context(), u.ID, projectID); err != nil {
-					apiError(w, http.StatusNotFound, "PROJECT_NOT_FOUND")
-					return
-				}
-				a.auth.setPreviewCookieNamed(w, r, cookieName, a.auth.signPreviewSession(u.ID, projectID))
-				query := r.URL.Query()
-				query.Del("preview_token")
-				r.URL.RawQuery = query.Encode()
-				http.Redirect(w, r, r.URL.RequestURI(), http.StatusSeeOther)
-				return
-			}
-			a.preview(w, contextWithUser(r, u))
-			return
-		}
+	// Never render a preview as a standalone website, even with old cookies.
+	if r.Header.Get("Sec-Fetch-Dest") == "document" {
+		apiError(w, 403, "PREVIEW_EMBED_ONLY")
+		return
 	}
-	apiError(w, http.StatusUnauthorized, "AUTH_REQUIRED")
+	userID := a.previewGateway().owner(projectID)
+	if userID == "" {
+		apiError(w, 401, "AUTH_REQUIRED")
+		return
+	}
+	if origin := r.Header.Get("Origin"); origin != "" && origin != "null" && origin != requestOrigin(r) {
+		apiError(w, 403, "PREVIEW_ORIGIN_DENIED")
+		return
+	}
+	p, err := a.projects.byID(r.Context(), userID, projectID)
+	if err != nil {
+		apiError(w, 404, "PROJECT_NOT_FOUND")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "same-origin")
+	w.Header().Set("Access-Control-Allow-Origin", "null")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Add("Vary", "Origin")
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", r.Header.Get("Access-Control-Request-Headers"))
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := a.projects.ensureRuntime(r.Context(), p); err != nil {
+		apiError(w, 503, "RUNTIME_UNAVAILABLE")
+		return
+	}
+	port := "3000"
+	if p.Deployed {
+		port = "3001"
+	}
+	target, _ := url.Parse("http://" + runtimeName(p.ID) + ":" + port)
+	proxy := newPreviewProxy(target)
+	restrictPreviewProxy(proxy, prefix, requestOrigin(r), "/projects/"+projectID)
+	proxy.ServeHTTP(w, r)
 }
 
 func (a *App) platformHandler() http.Handler {
@@ -210,7 +225,14 @@ func (a *App) platformHandler() http.Handler {
 	r.Route("/api", func(r chi.Router) {
 		r.With(authRateLimit).Post("/auth/register", a.auth.register)
 		r.With(authRateLimit).Post("/auth/login", a.auth.login)
-		r.Post("/auth/logout", a.auth.logout)
+		r.Post("/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+			if cookie, err := r.Cookie(sessionCookie); err == nil {
+				if userID, ok := a.auth.readSession(cookie.Value); ok {
+					a.previewGateway().revoke(userID)
+				}
+			}
+			a.auth.logout(w, r)
+		})
 		r.Group(func(r chi.Router) {
 			r.Use(a.auth.requireUser, middleware.Timeout(30*time.Second))
 			r.Get("/me", a.auth.me)
@@ -265,11 +287,6 @@ func (a *App) previewAccess(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, "PROJECT_READ_FAILED")
 		return
 	}
-	address, err := a.previewGateway().address(r, p.ID, a.auth.signPreview(u.ID, p.ID))
-	if err != nil {
-		apiError(w, http.StatusServiceUnavailable, "PREVIEW_CAPACITY_REACHED")
-		return
-	}
 	if err := a.projects.ensureRuntime(r.Context(), p); err != nil {
 		log.Printf("preview-access ensureRuntime failed project=%s deployPort=%d err=%v", p.ID, p.DeployPort, err)
 		apiError(w, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE")
@@ -282,31 +299,8 @@ func (a *App) previewAccess(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("preview-access ok project=%s deployPort=%d", p.ID, p.DeployPort)
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, map[string]any{"url": address})
-}
-
-func (a *App) preview(w http.ResponseWriter, r *http.Request) {
-	projectID, _ := r.Context().Value(previewProjectKey{}).(string)
-	u := r.Context().Value(currentUserKey{}).(User)
-	p, err := a.projects.byID(r.Context(), u.ID, projectID)
-	if err != nil || p.ID != projectID {
-		apiError(w, http.StatusNotFound, "PROJECT_NOT_FOUND")
-		return
-	}
-	if port, ok := r.Context().Value(previewGatewayPortKey{}).(string); ok {
-		if !a.previewGateway().touch(p.ID, port) {
-			apiError(w, http.StatusUnauthorized, "AUTH_REQUIRED")
-			return
-		}
-	}
-	if err := a.projects.ensureRuntime(r.Context(), p); err != nil {
-		apiError(w, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE")
-		return
-	}
-	a.projects.touch(r.Context(), p.ID)
-	target, _ := url.Parse("http://" + runtimeName(p.ID) + ":3000")
-	proxy := newPreviewProxy(target)
-	proxy.ServeHTTP(w, r)
+	a.previewGateway().lease(p.ID, u.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"url": requestOrigin(r) + previewPath(a.cfg.MasterKey, p.ID) + "/"})
 }
 
 func staticHandler(dir string) (http.Handler, error) {

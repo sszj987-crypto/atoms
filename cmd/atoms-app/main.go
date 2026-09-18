@@ -35,11 +35,6 @@ func main() {
 	}
 	log.Printf("atoms-app listening on http://localhost:%s", cfg.Port)
 	servers := []*http.Server{srv}
-	for _, port := range app.PreviewPorts() {
-		servers = append(servers, &http.Server{Addr: ":" + port, Handler: app.PreviewHandler(port), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second})
-	}
-	// Bind every configured preview port before accepting API requests, so the
-	// frontend never receives a URL for an unavailable gateway listener.
 	var listeners []net.Listener
 	for _, server := range servers {
 		listener, err := net.Listen("tcp", server.Addr)

@@ -14,6 +14,47 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+func TestPreviewProxyRequiresEmbeddedHTMLAndScopesCookies(t *testing.T) {
+	prefix, origin := "/__atoms_preview/project/cap", "http://example.test:8080"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Origin") == "null" {
+			t.Error("opaque Origin reached Next")
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		http.SetCookie(w, &http.Cookie{Name: "app_session", Value: "business", Path: "/"})
+		w.Write([]byte(`<!doctype html><html><head></head><body><img src="/photo.png"><a href="/about">About</a><script src="/__atoms_preview/project/cap/_next/static/main.js"></script><img src="//cdn.example.test/image.png"></body></html>`))
+	}))
+	defer upstream.Close()
+	target, _ := url.Parse(upstream.URL)
+	proxy := newPreviewProxy(target)
+	restrictPreviewProxy(proxy, prefix, origin, "/projects/project")
+	for _, tc := range []struct {
+		referer string
+		want    int
+	}{{"", 403}, {"http://evil.test/", 403}, {origin + "/projects/other", 403}, {origin + "/projects/project", 200}, {origin + prefix + "/", 200}} {
+		r := httptest.NewRequest("GET", origin+prefix+"/", nil)
+		r.Header.Set("Referer", tc.referer)
+		r.Header.Set("Origin", "null")
+		w := httptest.NewRecorder()
+		proxy.ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Fatalf("referer %q: %d %s", tc.referer, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Header().Get("Content-Security-Policy"), "sandbox allow-scripts") || strings.Contains(w.Header().Get("Content-Security-Policy"), "allow-same-origin") {
+			t.Fatal("preview shares platform privileges")
+		}
+		if cookies := w.Result().Cookies(); len(cookies) != 1 || cookies[0].Path != prefix+"/" {
+			t.Fatalf("business cookie escaped project path: %v", cookies)
+		}
+		if tc.want == 200 && (!strings.Contains(w.Body.String(), `src="`+prefix+`/photo.png"`) || !strings.Contains(w.Body.String(), "atoms-preview-request")) {
+			t.Fatal("viewer lost paths or request bridge")
+		}
+		if tc.want == 200 && (strings.Contains(w.Body.String(), prefix+prefix) || !strings.Contains(w.Body.String(), `src="//cdn.example.test/image.png"`)) {
+			t.Fatal("existing or external resource URL was corrupted")
+		}
+	}
+}
+
 func TestPreviewProxyPreservesRoutesAndIsolatesCookies(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RequestURI() != "/api/items?q=a%2Fb" || r.Method != "POST" {
@@ -82,51 +123,46 @@ func TestPreviewAuthenticationIntegration(t *testing.T) {
 	s := newProjectService(db, Config{}, nil)
 	defer s.shutdownRestores(ctx)
 	app := &App{db: db, auth: auth, projects: s, cfg: Config{WebDir: t.TempDir()}}
-	request := httptest.NewRequest("GET", "http://127.0.0.1:8080/api", nil)
-	_, err = app.previewGateway().address(request, p.ID, "fixture")
-	if err != nil {
-		t.Fatal(err)
+	router := app.Router()
+	prefix := previewPath(app.cfg.MasterKey, p.ID)
+	request := func(path, origin, dest string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "http://127.0.0.1:8080"+path, nil)
+		r.Header.Set("Origin", origin)
+		r.Header.Set("Sec-Fetch-Dest", dest)
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: auth.signSession(owner.ID)})
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		return w
 	}
-	router := app.PreviewHandler("8081")
-	entry := "http://127.0.0.1:8081/"
+	if w := request(prefix+"/", "", "iframe"); w.Code != 401 {
+		t.Fatalf("no active lease: %d", w.Code)
+	}
+	app.previewGateway().lease(p.ID, owner.ID)
 	for _, tc := range []struct {
-		name, token, origin string
-		status              int
+		path, origin, dest string
+		code               int
 	}{
-		{"anonymous", "", "", 401},
-		{"tampered", auth.signPreview(owner.ID, p.ID) + "broken", "", 401},
-		{"another project", auth.signPreview(owner.ID, newID()), "", 401},
-		{"another owner", auth.signPreview(other.ID, p.ID), "", 404},
-		{"cross origin", auth.signPreview(owner.ID, p.ID), "http://evil.example", 403},
-		{"owner", auth.signPreview(owner.ID, p.ID), "", 303},
+		{prefix + "/", "", "document", 403},
+		{previewNamespace + p.ID + "/wrong/", "", "iframe", 401},
+		{prefix + "/", "http://evil.example", "iframe", 403},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r := httptest.NewRequest("GET", entry+"?business=kept&preview_token="+url.QueryEscape(tc.token), nil)
-			if tc.origin != "" {
-				r.Header.Set("Origin", tc.origin)
-			}
-			w := httptest.NewRecorder()
-			router.ServeHTTP(w, r)
-			if w.Code != tc.status {
-				t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
-			}
-			if tc.status == 303 {
-				if w.Header().Get("Location") != "/?business=kept" {
-					t.Fatalf("ticket not stripped: %s", w.Header().Get("Location"))
-				}
-				cookies := w.Result().Cookies()
-				if len(cookies) != 1 || cookies[0].Name != previewCookie+"_8081" || !cookies[0].HttpOnly || cookies[0].Secure || cookies[0].SameSite != http.SameSiteLaxMode {
-					t.Fatalf("invalid preview cookie: %#v", cookies)
-				}
-				uid, pid, ok := auth.readPreview(cookies[0].Value)
-				if !ok || uid != owner.ID || pid != p.ID {
-					t.Fatal("invalid preview session")
-				}
-			}
-		})
+		if w := request(tc.path, tc.origin, tc.dest); w.Code != tc.code {
+			t.Fatalf("deny: %d want %d", w.Code, tc.code)
+		}
+	}
+	app.previewGateway().lease(p.ID, other.ID)
+	if w := request(prefix+"/", "", "iframe"); w.Code != 404 {
+		t.Fatalf("wrong owner: %d", w.Code)
+	}
+	app.previewGateway().lease(p.ID, owner.ID)
+	r := httptest.NewRequest("POST", "http://127.0.0.1:8080/api/auth/logout", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: auth.signSession(owner.ID)})
+	router.ServeHTTP(httptest.NewRecorder(), r)
+	if app.previewGateway().owner(p.ID) != "" {
+		t.Fatal("logout retained preview access")
 	}
 	loaded, err := s.byID(ctx, owner.ID, p.ID)
 	if err != nil || loaded.Deployed {
-		t.Fatalf("new projects must be private: %+v %v", loaded, err)
+		t.Fatalf("new project publication: %+v %v", loaded, err)
 	}
 }

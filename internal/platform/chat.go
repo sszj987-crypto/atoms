@@ -332,7 +332,7 @@ func (s *chatService) verify(ctx context.Context, p Project, runID string) error
 
 	smoke := runProgressEvent{StepID: "verify-smoke", Kind: "verify", Title: "预览页面检查", Detail: "GET /", Status: "running"}
 	s.progressEvent(ctx, runID, smoke)
-	if _, err := s.projects.docker.exec(ctx, runtimeName(p.ID), []string{"sh", "-lc", "curl -fsS http://127.0.0.1:3000/ >/dev/null"}, nil); err != nil {
+	if _, err := s.projects.docker.exec(ctx, runtimeName(p.ID), []string{"sh", "-lc", "curl -LfsS http://127.0.0.1:3000/ >/dev/null"}, nil); err != nil {
 		smoke.Status = "failed"
 		smoke.Detail = "预览首页请求失败"
 		s.progressEvent(ctx, runID, smoke)

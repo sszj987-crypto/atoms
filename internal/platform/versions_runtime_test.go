@@ -43,7 +43,6 @@ func TestVersionsRealRuntime(t *testing.T) {
 	}
 	key := bytes.Repeat([]byte{3}, 32)
 	cfg := Config{ProjectRoot: "/data/users", MasterKey: key, SessionKey: key, RuntimeImage: os.Getenv("ATOMS_VERSIONS_TEST_IMAGE"), RuntimeNetwork: network, DataVolumeName: volume, RuntimeCPU: 2, RuntimeMemoryBytes: 2 << 30, RuntimePIDs: 256, DeployPortBase: 19410, DeployPortSpan: 2, WebDir: "/test-web"}
-	cfg.PreviewPortRange = "19510-19511"
 	if cfg.RuntimeImage == "" {
 		t.Fatal("explicit test Runtime image is required")
 	}
@@ -83,15 +82,7 @@ func TestVersionsRealRuntime(t *testing.T) {
 	if status, e := s.docker.inspect(ctx, runtimeName(p.ID)); e != nil || len(status.PublishedPorts) != 0 {
 		t.Fatalf("unpublished project exposes a host port: %+v %v", status, e)
 	}
-	for _, port := range app.PreviewPorts() {
-		listener, e := net.Listen("tcp", ":"+port)
-		if e != nil {
-			t.Fatal(e)
-		}
-		gateway := &http.Server{Handler: app.PreviewHandler(port), ReadHeaderTimeout: 10 * time.Second}
-		defer gateway.Close()
-		go gateway.Serve(listener)
-	}
+
 	if err = (projectVersionRuntime{s}).StartPrevious(ctx, p); err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +198,7 @@ func TestVersionsRealRuntime(t *testing.T) {
 		if w.Code != 200 || !strings.Contains(w.Body.String(), marker) {
 			t.Fatalf("file panel source: %d %s", w.Code, w.Body.String())
 		}
-		out, e := s.docker.exec(ctx, runtimeName(p.ID), []string{"sh", "-lc", "curl --max-time 30 -fsS http://127.0.0.1:3000/"}, nil)
+		out, e := s.docker.exec(ctx, runtimeName(p.ID), []string{"sh", "-lc", "curl --max-time 30 -LfSs http://127.0.0.1:3000/"}, nil)
 		if e != nil || !strings.Contains(string(out), marker) {
 			t.Fatalf("actual Preview does not match %s: %v", marker, e)
 		}
@@ -261,7 +252,7 @@ func TestVersionsRealRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	jar, _ := cookiejar.New(nil)
-	client := &http.Client{Jar: jar, Timeout: 30 * time.Second}
+	client := &http.Client{Jar: jar, Timeout: 30 * time.Second, Transport: previewFixtureTransport{projectID: p.ID}}
 	response, e := client.Get(entry.URL)
 	if e != nil {
 		t.Fatal(e)
@@ -279,10 +270,10 @@ func TestVersionsRealRuntime(t *testing.T) {
 		t.Fatal(e)
 	}
 	response.Body.Close()
-	if response.StatusCode != 401 {
-		t.Fatalf("anonymous preview: %d", response.StatusCode)
+	if response.StatusCode != 403 {
+		t.Fatalf("standalone preview: %d", response.StatusCode)
 	}
-	clean.Path = "/api/health"
+	clean.Path = strings.TrimSuffix(clean.Path, "/") + "/api/health"
 	response, e = client.Get(clean.String())
 	if e != nil {
 		t.Fatal(e)

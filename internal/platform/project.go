@@ -38,6 +38,7 @@ type Project struct {
 	LastAccessedAt       time.Time `json:"last_accessed_at"`
 	DeployPort           int       `json:"deploy_port"`
 	Deployed             bool      `json:"deployed"`
+	PreviewPath          string    `json:"-"`
 }
 type projectService struct {
 	db             *pgxpool.Pool
@@ -495,12 +496,13 @@ func (s *projectService) ensureRuntime(ctx context.Context, p Project) error {
 	return tx.Commit(ctx)
 }
 func (s *projectService) ensureRuntimeLocked(ctx context.Context, p Project) error {
+	p.PreviewPath = previewPath(s.cfg.MasterKey, p.ID)
 	status, err := s.docker.inspect(ctx, runtimeName(p.ID))
 	if err != nil {
 		log.Printf("ensureRuntime inspect failed project=%s err=%v", p.ID, err)
 		return err
 	}
-	if status.Running && runtimePublicationMatches(status, p) {
+	if status.Running && runtimePublicationMatches(status, p) && status.PreviewPath == p.PreviewPath {
 		return nil
 	}
 	if status.Exists {

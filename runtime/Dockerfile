@@ -9,5 +9,6 @@ ENV npm_config_store_dir=/home/node/.local/share/pnpm/store
 RUN cd /tmp/atoms-starter && pnpm install --offline --frozen-lockfile
 COPY --chmod=755 runtime/entrypoint.sh /usr/local/bin/atoms-runtime-entrypoint
 COPY --chmod=755 runtime/version-screenshot.sh /usr/local/bin/atoms-version-screenshot
+COPY runtime/preview-runtime.cjs /usr/local/lib/atoms-preview-runtime.cjs
 WORKDIR /workspace
 ENTRYPOINT ["atoms-runtime-entrypoint"]

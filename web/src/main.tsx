@@ -4,6 +4,7 @@ import { RunProgressPanel } from "./RunProgressPanel";
 import { SourceFilesPanel } from "./SourceFilesPanel";
 import { VersionHistoryDrawer, VersionRestoreNotice, useVersionHistory, restoreIsBusy } from "./VersionHistory";
 import { WorkspaceHeader } from "./WorkspaceHeader";
+import { ProjectPreview } from "./ProjectPreview";
 import { currentVersionNumber } from "./versionHistoryState";
 import "./styles.css";
 import "./phase2.css";
@@ -346,7 +347,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
   useEffect(() => {
     if (!previewURL) return;
     let active = true;
-    // Keep an open workspace's proxy slot alive without reloading its iframe.
+    // Renew the owner's preview lease without reloading the iframe.
     const timer = window.setInterval(() => {
       api<{ url: string }>(`/project/${project.id}/preview-access`, undefined, 150_000).then(r => {
         if (active && r.url.split("?")[0] !== previewURL.split("?")[0]) setPreviewURL(r.url);
@@ -492,7 +493,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
               <button className="icon-button" disabled={restoring || !versionHistory.known} aria-label="刷新预览" title="刷新预览" onClick={refreshPreview}>↻</button>
             </div>
           </div>
-          {previewURL ? <iframe key={reload} title="项目预览" src={previewURL} /> : previewError ? <div className="preview-loading" role="alert"><p>{previewError}</p><button disabled={restoring || !versionHistory.known} onClick={refreshPreview}>重新启动</button></div> : <div className="preview-loading" role="status"><span className="spinner" aria-hidden="true" /><p>{restoring ? "版本恢复完成后重新载入预览…" : "正在启动项目预览…"}</p></div>}
+          {previewURL ? <ProjectPreview key={reload} projectID={project.id} url={previewURL} /> : previewError ? <div className="preview-loading" role="alert"><p>{previewError}</p><button disabled={restoring || !versionHistory.known} onClick={refreshPreview}>重新启动</button></div> : <div className="preview-loading" role="status"><span className="spinner" aria-hidden="true" /><p>{restoring ? "版本恢复完成后重新载入预览…" : "正在启动项目预览…"}</p></div>}
           </div>
           <SourceFilesPanel key={project.id} projectID={project.id} visible={outputPane === "files"} restoring={restoring} runActive={runKnown && versionHistory.known ? !!run || sending || projectBusy : null} refreshKey={reload} request={api} formatError={errorText} />
         </div>

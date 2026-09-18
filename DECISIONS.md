@@ -33,7 +33,7 @@
 - Platform services: `atoms-app` + `postgres`.
 - Platform control-plane port: `8080`.
 - Project Runtime keeps its assigned application port private until explicit deployment. `deployed` persists publication intent; Docker remains the source of Runtime status.
-- Authenticated platform preview proxies use `PREVIEW_PORT_RANGE` (default `8081-8100`), one origin per active project. Preview supports server IPs without wildcard DNS.
+- Private previews use project-scoped paths under the platform port `8080`; do not publish standalone preview ports. An opaque sandbox separates generated JavaScript from platform credentials/APIs. Only the owner can activate/renew a 30-minute preview lease; logout revokes it. Direct browser document navigation is denied.
 - PostgreSQL is not exposed to the host by default.
 - Internal Docker network: `atoms-internal`.
 
@@ -57,8 +57,8 @@
 - The Projects page still uses plural project-oriented information architecture.
 - One project has at most one Runtime Container.
 - Project files are physically isolated by user and project.
-- The embedded Preview and new-tab action use the same authenticated proxy endpoint; its displayed address is read-only and hides the bootstrap credential.
-- Preview and deployment share one Runtime/source workspace. Development and source restore affect an already deployed app; publication stays enabled through restart/restore until project deletion.
+- Preview is embedded only in the project workspace. Its scoped path preserves Next routes and HMR; a parent request/storage bridge is restricted to that exact project. Generated apps cannot use this bridge to access platform APIs.
+- Preview and publication share one Runtime/source workspace. Private Next preview uses an enforced basePath and separate build directory without changing source/config. Published runtimes also start the public root-path server; only that server's port is published. Development/source restore still affect a published app. Cancellation of publication removes the public server/binding while preserving private preview.
 - On upgrade, legacy always-published previews become private until explicitly deployed again.
 
 Data layout:

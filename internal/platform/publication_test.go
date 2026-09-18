@@ -64,7 +64,7 @@ func TestPublicationLifecycleIntegration(t *testing.T) {
 			if published {
 				bindings["3000/tcp"] = []map[string]string{{"HostPort": "18450"}}
 			}
-			writeJSON(w, 200, map[string]any{"State": map[string]bool{"Running": running}, "HostConfig": map[string]any{"PortBindings": bindings}})
+			writeJSON(w, 200, map[string]any{"State": map[string]bool{"Running": running}, "HostConfig": map[string]any{"PortBindings": bindings}, "Config": map[string]any{"Env": []string{"ATOMS_PREVIEW_BASE_PATH=" + previewPath(key, id)}}})
 		case r.Method == "DELETE":
 			mutations++
 			published = false
@@ -169,22 +169,16 @@ func TestPublicationLifecycleIntegration(t *testing.T) {
 	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &entry) != nil {
 		t.Fatalf("private preview access: %d %s", response.Code, response.Body.String())
 	}
-	gateway := app.PreviewHandler("8081")
-	bootstrap := httptest.NewRecorder()
-	gateway.ServeHTTP(bootstrap, httptest.NewRequest("GET", entry.URL, nil))
-	if bootstrap.Code != http.StatusSeeOther || len(bootstrap.Result().Cookies()) != 1 {
-		t.Fatalf("preview bootstrap: %d %s", bootstrap.Code, bootstrap.Body.String())
-	}
-	for _, authenticated := range []bool{false, true} {
-		r := httptest.NewRequest("GET", "http://localhost:8081/", nil)
-		want := 401
-		if authenticated {
-			r.AddCookie(bootstrap.Result().Cookies()[0])
-			want = 200
-		}
+	for _, tc := range []struct {
+		dest string
+		want int
+	}{{"document", 403}, {"empty", 200}} {
+		r := httptest.NewRequest("GET", entry.URL, nil)
+		r.Header.Set("Sec-Fetch-Dest", tc.dest)
+		r.Header.Set("Referer", "http://localhost/projects/"+id)
 		w := httptest.NewRecorder()
-		gateway.ServeHTTP(w, r)
-		if w.Code != want || authenticated && w.Body.String() != "private preview" {
+		router.ServeHTTP(w, r)
+		if w.Code != tc.want || tc.want == 200 && w.Body.String() != "private preview" {
 			t.Fatalf("preview after unpublish: %d %s", w.Code, w.Body.String())
 		}
 	}

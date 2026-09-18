@@ -1266,22 +1266,13 @@ Codex 的主要工作应该集中在：
 
 # 29. Preview
 
-Platform 控制面暴露宿主机端口 `8080`，鉴权预览代理使用 `PREVIEW_PORT_RANGE`。每个用户获得一个部署端口段，每个项目从中获得一个稳定且唯一的应用端口；只有显式部署后才发布 Runtime 的 `3000` 端口。
+Platform 只暴露宿主机端口 `8080`。未发布应用不开放独立公网预览端口。
 
-```text
-Platform:
-http://localhost:8080
+工作区预览使用同一平台入口下的项目私有路径 `/__atoms_preview/{project_id}/{capability}/`，只能在工作区内嵌显示。项目所有者登录后启动/续期 30 分钟预览租约，退出撤销。地址栏直接打开预览文档会被拒绝。
 
-Project Preview / New Tab (authenticated):
-http://localhost:<preview_gateway_port>
+内嵌页面采用 opaque-origin sandbox，不能读取平台页面或调用平台 API。父页面的接口与存储桥只接受当前 iframe 发来的当前项目路径请求。项目 Cookie 限制在该项目路径，平台凭证不会转发给 Runtime。
 
-Deployed application:
-http://host:<project_deploy_port>
-```
-
-工作区内嵌 Preview 和“新标签页打开”使用同一个平台鉴权代理地址，保留应用完整路由、API 与 WebSocket/HMR。默认代理端口为 PREVIEW_PORT_RANGE（8081–8100），每个活跃项目独占一个代理入口；该入口需要项目级签名凭证，匿名访问返回 401。地址栏只读并隐藏初始化凭证。
-
-开发时 Runtime 不发布项目的宿主机应用端口，点击部署后才发布长期分配的应用端口。部署状态持久化，重启、源码恢复与空闲后重建保留该状态。最小实现中预览和部署共用 Runtime 与源码，后续修改会影响已部署应用。升级后旧项目恢复为未部署并关闭旧端口，需要再次点击部署才开放。
+Runtime 中私有 Next 服务使用强制 basePath 和独立构建目录，保留路由、API 和 WebSocket/HMR；不修改项目源码/config。发布时同一容器额外运行公开根路径服务，只映射公开服务端口。取消发布移除公开服务/端口，保留源码、数据及内嵌预览。发布与预览仍共用源码，后续开发和恢复会影响已发布应用。
 
 ---
 

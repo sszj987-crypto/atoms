@@ -14,7 +14,6 @@ type Config struct {
 	MasterKey            []byte
 	SessionKey           []byte
 	Port                 string
-	PreviewPortRange     string
 	WebDir               string
 	ProjectRoot          string
 	RuntimeImage         string
@@ -46,16 +45,6 @@ func LoadConfig() (Config, error) {
 	if port == "" {
 		port = "8080"
 	}
-	previewPortRange := os.Getenv("PREVIEW_PORT_RANGE")
-	previewPorts, err := parsePreviewPorts(previewPortRange)
-	if err != nil {
-		return Config{}, err
-	}
-	for _, previewPort := range previewPorts {
-		if previewPort == port {
-			return Config{}, fmt.Errorf("preview ports overlap APP_PORT")
-		}
-	}
 	webDir := os.Getenv("WEB_DIR")
 	if webDir == "" {
 		webDir = "web/dist"
@@ -84,13 +73,7 @@ func LoadConfig() (Config, error) {
 	if deployPortBase < 1 || deployPortBase > 65535 || deployPortSpan > 65535-deployPortBase+1 {
 		return Config{}, fmt.Errorf("deployment port range must stay within 1-65535")
 	}
-	for _, previewPort := range previewPorts {
-		number, _ := strconv.Atoi(previewPort)
-		if number >= deployPortBase {
-			return Config{}, fmt.Errorf("PREVIEW_PORT_RANGE must be below DEPLOY_PORT_BASE")
-		}
-	}
-	return Config{DatabaseURL: db, MasterKey: key, SessionKey: sessionKey, Port: port, PreviewPortRange: previewPortRange, WebDir: webDir, ProjectRoot: projectRoot, RuntimeImage: image, RuntimeCPU: 2, RuntimeMemoryBytes: 2 << 30, RuntimePIDs: 256, RuntimeIdleTTL: 24 * time.Hour, RuntimeSweepInterval: 15 * time.Minute, DataVolumeName: volume, RuntimeNetwork: network, DeployPortBase: deployPortBase, DeployPortSpan: deployPortSpan}, nil
+	return Config{DatabaseURL: db, MasterKey: key, SessionKey: sessionKey, Port: port, WebDir: webDir, ProjectRoot: projectRoot, RuntimeImage: image, RuntimeCPU: 2, RuntimeMemoryBytes: 2 << 30, RuntimePIDs: 256, RuntimeIdleTTL: 24 * time.Hour, RuntimeSweepInterval: 15 * time.Minute, DataVolumeName: volume, RuntimeNetwork: network, DeployPortBase: deployPortBase, DeployPortSpan: deployPortSpan}, nil
 }
 
 func envInt(name string, def int) int {

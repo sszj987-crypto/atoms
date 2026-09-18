@@ -55,7 +55,7 @@ func sourcePathAllowed(name string) bool {
 	for _, part := range strings.Split(name, "/") {
 		lower := strings.ToLower(part)
 		switch lower {
-		case "node_modules", ".next", ".next-dev", "dist", "build", "out", "coverage", ".cache", ".turbo", ".vite", ".pnpm-store", ".git", ".codex", "codex", ".atoms", "logs", ".ssh", ".aws", ".vercel", ".netlify", ".npmrc", ".pnpmrc", ".yarnrc", ".yarnrc.yml", ".ds_store", "id_rsa", "id_ed25519", "credentials.json", "secrets.json":
+		case "node_modules", ".next", ".next-dev", ".next-preview", "dist", "build", "out", "coverage", ".cache", ".turbo", ".vite", ".pnpm-store", ".git", ".codex", "codex", ".atoms", "logs", ".ssh", ".aws", ".vercel", ".netlify", ".npmrc", ".pnpmrc", ".yarnrc", ".yarnrc.yml", ".ds_store", "id_rsa", "id_ed25519", "credentials.json", "secrets.json":
 			return false
 		}
 		if strings.HasPrefix(lower, ".atoms-") || strings.HasPrefix(lower, ".env") && lower != ".env.example" && lower != ".env.sample" && lower != ".env.template" {

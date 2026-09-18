@@ -22,6 +22,7 @@ type dockerContainer struct {
 	Exists         bool
 	Running        bool
 	PublishedPorts []string
+	PreviewPath    string
 }
 
 func newDockerClient() *dockerClient {
@@ -63,7 +64,8 @@ func (d *dockerClient) inspect(ctx context.Context, name string) (dockerContaine
 		return dockerContainer{}, dockerError(res)
 	}
 	var raw struct {
-		State struct {
+		Config struct{ Env []string } `json:"Config"`
+		State  struct {
 			Running bool `json:"Running"`
 		} `json:"State"`
 		HostConfig struct {
@@ -74,6 +76,11 @@ func (d *dockerClient) inspect(ctx context.Context, name string) (dockerContaine
 		return dockerContainer{}, err
 	}
 	container := dockerContainer{Exists: true, Running: raw.State.Running}
+	for _, entry := range raw.Config.Env {
+		if strings.HasPrefix(entry, "ATOMS_PREVIEW_BASE_PATH=") {
+			container.PreviewPath = strings.TrimPrefix(entry, "ATOMS_PREVIEW_BASE_PATH=")
+		}
+	}
 	for _, bindings := range raw.HostConfig.PortBindings {
 		for _, binding := range bindings {
 			container.PublishedPorts = append(container.PublishedPorts, binding.HostPort)
@@ -126,8 +133,8 @@ func (d *dockerClient) createAndStart(ctx context.Context, p Project, databaseUR
 		"ExposedPorts": map[string]any{"3000/tcp": map[string]any{}},
 		// The preview server is the Runtime's primary process. This avoids a
 		// detached docker-exec race and lets Docker report a failed startup.
-		"Cmd":    []string{"sh", "-lc", "if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile --prefer-offline; else pnpm install --frozen-lockfile=false --prefer-offline; fi && pnpm dev --hostname 0.0.0.0 --port 3000"},
-		"Env":    []string{"DATABASE_URL=" + databaseURL, "NEXT_TELEMETRY_DISABLED=1"},
+		"Cmd":    []string{"sh", "-lc", "if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile --prefer-offline; else pnpm install --frozen-lockfile=false --prefer-offline; fi && node /usr/local/lib/atoms-preview-runtime.cjs"},
+		"Env":    []string{"DATABASE_URL=" + databaseURL, "NEXT_TELEMETRY_DISABLED=1", "ATOMS_PREVIEW_BASE_PATH=" + p.PreviewPath, fmt.Sprintf("ATOMS_PUBLISHED=%t", p.Deployed)},
 		"Labels": map[string]string{"atoms.managed": "true", "atoms.project_id": p.ID},
 		"HostConfig": map[string]any{
 			"NanoCpus":     cpu * 1_000_000_000,
