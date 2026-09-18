@@ -1,5 +1,5 @@
 FROM node:22-alpine
-RUN apk add --no-cache bash curl git chromium font-noto-cjk && corepack disable && npm install -g pnpm@10.15.1 @openai/codex@0.153.4
+RUN sed -i "s/dl-cdn.alpinelinux.org/mirrors.tencent.com/g" /etc/apk/repositories && apk add --no-cache bash curl git chromium font-noto-cjk && corepack disable && npm install -g pnpm@10.15.1 @openai/codex@0.153.4
 COPY --chown=node:node internal/platform/starter/package.json internal/platform/starter/pnpm-lock.yaml /tmp/atoms-starter/
 USER node
 RUN cd /tmp/atoms-starter && pnpm fetch
