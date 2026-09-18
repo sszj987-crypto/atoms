@@ -446,7 +446,7 @@ func (v projectVersionRuntime) Verify(ctx context.Context, p Project) error {
 	if e := waitRuntimeReady(ctx, p.ID); e != nil {
 		return e
 	}
-	for _, check := range []struct{ command, reason string }{{"pnpm install --frozen-lockfile --prefer-offline", "历史版本锁定依赖安装失败"}, {"pnpm typecheck", "历史版本类型检查失败"}, {"pnpm build", "历史版本生产构建失败"}} {
+	for _, check := range []struct{ command, reason string }{{"pnpm typecheck", "历史版本类型检查失败"}, {"pnpm build", "历史版本生产构建失败"}} {
 		if _, e := v.s.docker.exec(ctx, runtimeName(p.ID), []string{"sh", "-lc", check.command}, nil); e != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -454,12 +454,9 @@ func (v projectVersionRuntime) Verify(ctx context.Context, p Project) error {
 			return &restoreCheckError{check.reason}
 		}
 	}
-	if e := v.s.recreateRuntime(ctx, p); e != nil {
-		return e
-	}
-	if e := waitRuntimeReady(ctx, p.ID); e != nil {
-		return e
-	}
+	// Runtime startup has already installed the restored lockfile. Its private
+	// dev build directory is separate from pnpm build, so production verification
+	// does not require another container restart (and dependency install).
 	if _, e := v.s.docker.exec(ctx, runtimeName(p.ID), []string{"sh", "-lc", "curl --max-time 30 -LfsS http://127.0.0.1:3000/ >/dev/null"}, nil); e != nil {
 		return &restoreCheckError{"历史版本首页 HTTP 检查失败"}
 	}

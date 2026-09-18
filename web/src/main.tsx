@@ -283,6 +283,7 @@ function Projects({ setPage, projects, onDeleted, onUpdated }: { setPage: Naviga
 function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { project: Project; initialDraft: string; onDraftConsumed: () => void; onBack: () => void }) {
   const [status, setStatus] = useState("正在恢复项目环境…");
   const [reload, setReload] = useState(0);
+  const [frameReload, setFrameReload] = useState(0);
   const [messages, setMessages] = useState<{ id: string; role: string; content: string }[]>([]);
   const [text, setText] = useState("");
   const [run, setRun] = useState<string | null>(null);
@@ -432,7 +433,8 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
     finally { setSending(false); }
   }
   function refreshPreview() {
-    setReload(v => v + 1);
+    if (previewURL) setFrameReload(v => v + 1);
+    else setReload(v => v + 1);
   }
   async function cancelRun() {
     if (!run) return;
@@ -493,7 +495,7 @@ function ProjectWorkspace({ project, initialDraft, onDraftConsumed, onBack }: { 
               <button className="icon-button" disabled={restoring || !versionHistory.known} aria-label="刷新预览" title="刷新预览" onClick={refreshPreview}>↻</button>
             </div>
           </div>
-          {previewURL ? <ProjectPreview key={reload} projectID={project.id} url={previewURL} /> : previewError ? <div className="preview-loading" role="alert"><p>{previewError}</p><button disabled={restoring || !versionHistory.known} onClick={refreshPreview}>重新启动</button></div> : <div className="preview-loading" role="status"><span className="spinner" aria-hidden="true" /><p>{restoring ? "版本恢复完成后重新载入预览…" : "正在启动项目预览…"}</p></div>}
+          {previewURL ? <ProjectPreview key={`${reload}:${frameReload}`} projectID={project.id} url={previewURL} /> : previewError ? <div className="preview-loading" role="alert"><p>{previewError}</p><button disabled={restoring || !versionHistory.known} onClick={refreshPreview}>重新启动</button></div> : <div className="preview-loading" role="status"><span className="spinner" aria-hidden="true" /><p>{restoring ? "版本恢复完成后重新载入预览…" : "正在启动项目预览…"}</p></div>}
           </div>
           <SourceFilesPanel key={project.id} projectID={project.id} visible={outputPane === "files"} restoring={restoring} runActive={runKnown && versionHistory.known ? !!run || sending || projectBusy : null} refreshKey={reload} request={api} formatError={errorText} />
         </div>
